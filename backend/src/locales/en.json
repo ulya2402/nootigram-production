@@ -1,0 +1,8 @@
+{
+  "bot_welcome": "👋 Welcome to Nootigram, %name%! A chill place to jot down ideas, capture your thoughts, and send your notes as rich text right on Telegram.",
+  "open_app": "Open Nootigram",
+  "lang_switched": "Display language has been changed to English.",
+  "select_lang": "Choose your display language below:",
+  "export_success": "Your note has been sent to Telegram.",
+  "export_failed": "Failed to send the rich text message."
+}
