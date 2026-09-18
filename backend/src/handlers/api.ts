@@ -21,15 +21,27 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
 
   if (request.method === 'GET' && path === '/api/notes') {
     try {
-      const [userRow, topicRows, noteRows] = await Promise.all([
-        env.DB.prepare('SELECT language_code FROM users WHERE telegram_id = ?').bind(userId).first<{ language_code: string }>(),
-        env.DB.prepare('SELECT * FROM topics WHERE telegram_id = ? ORDER BY created_at ASC').bind(userId).all(),
-        env.DB.prepare('SELECT * FROM notes WHERE telegram_id = ? ORDER BY is_pinned DESC, updated_at DESC').bind(userId).all(),
+      const results = await env.DB.batch([
+        env.DB.prepare('SELECT language_code FROM users WHERE telegram_id = ?').bind(userId),
+        env.DB.prepare('SELECT id, name, is_default FROM topics WHERE telegram_id = ? ORDER BY created_at ASC').bind(userId),
+        env.DB.prepare("SELECT id, category, title, content_raw, blocks_json, is_pinned, strftime('%Y-%m-%dT%H:%M:%SZ', updated_at) AS updated_at FROM notes WHERE telegram_id = ? ORDER BY is_pinned DESC, updated_at DESC").bind(userId),
       ]);
 
-      let finalTopics = topicRows.results.map((t) => ({
-        id: t.id as string,
-        name: t.name as string,
+      const userRow = results[0].results[0] as { language_code?: string } | undefined;
+      const rawTopics = results[1].results as unknown as { id: string; name: string; is_default: number | boolean }[];
+      const rawNotes = results[2].results as unknown as {
+        id: string;
+        category: string;
+        title: string;
+        content_raw: string;
+        blocks_json: string;
+        is_pinned: number | boolean;
+        updated_at: string;
+      }[];
+
+      let finalTopics = rawTopics.map((t) => ({
+        id: t.id,
+        name: t.name,
         is_default: Boolean(t.is_default),
       }));
 
@@ -44,22 +56,22 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
         ];
       }
 
-      const notes = noteRows.results.map((r) => ({
-        id: r.id as string,
-        category: r.category as string,
-        title: r.title as string,
-        content_raw: r.content_raw as string,
-        blocks: JSON.parse(r.blocks_json as string),
+      const notes = rawNotes.map((r) => ({
+        id: r.id,
+        category: r.category,
+        title: r.title,
+        content_raw: r.content_raw,
+        blocks: JSON.parse(r.blocks_json),
         is_pinned: Boolean(r.is_pinned),
         is_favorite: Boolean(r.is_pinned),
-        updated_at_str: r.updated_at as string,
+        updated_at_str: r.updated_at,
       }));
 
       return new Response(
         JSON.stringify({
           notes,
           topics: finalTopics,
-          language_code: userRow?.language_code || 'id',
+          language_code: userRow?.language_code || 'en',
         }),
         { headers: { 'Content-Type': 'application/json' } }
       );
@@ -119,8 +131,10 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
           env.DB.prepare('DELETE FROM notes WHERE id = ? AND telegram_id = ?').bind(nId, userId)
         );
         await env.DB.batch(statements);
+        console.log(`BATCH_NOTES_DELETED_SUCCESS: count=${body.ids.length}, user=${userId}`);
       } else if (body.id) {
         await env.DB.prepare('DELETE FROM notes WHERE id = ? AND telegram_id = ?').bind(body.id, userId).run();
+        console.log(`NOTE_DELETED_SUCCESS: note_id=${body.id}, user=${userId}`);
       }
 
       return new Response(JSON.stringify({ success: true }), {
@@ -167,24 +181,30 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
 
   if (request.method === 'POST' && path === '/api/notes/export') {
     try {
-      const payload = (await request.json()) as {
-        note_id: string;
-        note?: NotePayload;
-        compiled_html?: string;
-        compiled_markdown?: string;
-      };
+      const payload = (await request.json()) as { note_id: string; note?: NotePayload };
+      let blocks: any[] = [];
 
-      let sent = false;
-
-      if (payload.compiled_markdown) {
-        sent = await telegram.sendRichMessage(userId, { markdown: payload.compiled_markdown });
-      }
-
-      if (!sent && payload.compiled_html) {
-        sent = await telegram.sendMessage(userId, payload.compiled_html, undefined, 'HTML');
-      }
-
-      if (!sent) {
+      if (payload.note && payload.note.blocks) {
+        blocks = payload.note.blocks;
+        await env.DB.prepare(`
+          INSERT INTO notes (id, telegram_id, category, title, content_raw, blocks_json, is_pinned, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+          ON CONFLICT(id) DO UPDATE SET
+            title = excluded.title,
+            blocks_json = excluded.blocks_json,
+            updated_at = CURRENT_TIMESTAMP
+        `)
+          .bind(
+            payload.note.id,
+            userId,
+            payload.note.category,
+            payload.note.title,
+            payload.note.content_raw || '',
+            JSON.stringify(payload.note.blocks),
+            payload.note.is_pinned ? 1 : 0
+          )
+          .run();
+      } else {
         const row = await env.DB.prepare('SELECT * FROM notes WHERE id = ? AND telegram_id = ?')
           .bind(payload.note_id, userId)
           .first();
@@ -192,12 +212,18 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
         if (!row) {
           return new Response(JSON.stringify({ error: 'NOTE_NOT_FOUND' }), { status: 404 });
         }
-
-        const blocks = JSON.parse(row.blocks_json as string);
-        sent = await telegram.sendRichMessage(userId, { blocks });
+        blocks = JSON.parse(row.blocks_json as string);
       }
 
-      return new Response(JSON.stringify({ success: sent }), {
+      const sendResult = await telegram.sendRichMessage(userId, { blocks });
+      if (!sendResult.ok && sendResult.errorCode === 403) {
+        const botUsername = await telegram.getBotUsername();
+        return new Response(JSON.stringify({ success: false, error: 'NEED_START_BOT', bot_username: botUsername }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      return new Response(JSON.stringify({ success: sendResult.ok }), {
         headers: { 'Content-Type': 'application/json' },
       });
     } catch (error) {

@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { NoteItem, ContentBlock, TaskItem, TableCell, TopicItem } from '../types';
 import { t } from '../services/i18n';
 import { exportNoteToTelegram } from '../services/api';
@@ -11,6 +12,36 @@ interface EditorViewProps {
   onDelete: (id: string) => void;
 }
 
+const EditableBlock: React.FC<{
+  html: string;
+  placeholder: string;
+  className?: string;
+  onFocus?: () => void;
+  onChange: (newHtml: string) => void;
+}> = ({ html, placeholder, className, onFocus, onChange }) => {
+  const divRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (divRef.current && divRef.current.innerHTML !== html) {
+      divRef.current.innerHTML = html || '';
+    }
+  }, [html]);
+
+  return (
+    <div
+      ref={divRef}
+      contentEditable
+      suppressContentEditableWarning
+      data-placeholder={placeholder}
+      onFocus={onFocus}
+      onInput={(e) => {
+        onChange(e.currentTarget.innerHTML);
+      }}
+      className={className}
+    />
+  );
+};
+
 export const EditorView: React.FC<EditorViewProps> = ({
   note,
   topics,
@@ -18,20 +49,309 @@ export const EditorView: React.FC<EditorViewProps> = ({
   onSave,
   onDelete,
 }) => {
-  const initialBlocks = note.blocks && note.blocks.length > 0
-    ? note.blocks
-    : [{ id: `p-${Date.now()}`, type: 'paragraph', text: '' } as ContentBlock];
+  const normalizeBlocks = (rawBlocks: ContentBlock[]): ContentBlock[] => {
+    if (!rawBlocks || rawBlocks.length === 0) {
+      return [{ id: `p-${Date.now()}`, type: 'paragraph', text: '' }];
+    }
+    return rawBlocks.map((b, idx) => {
+      const id = b.id || `block-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`;
+      if (b.type === 'list') {
+        const hasTaskStyle = b.style === 'task' || (!b.style && b.items?.some((i: any) => i.has_checkbox || i.is_checked !== undefined));
+        const resolvedStyle = hasTaskStyle ? 'task' : (b.style || 'bullet');
+        return {
+          ...b,
+          id,
+          style: resolvedStyle,
+          items: (b.items || []).map((it) => ({
+            id: it.id || `task-${Date.now()}-${Math.random()}`,
+            text: it.text || '',
+            is_checked: Boolean(it.is_checked),
+          })),
+        };
+      }
+      return { ...b, id };
+    });
+  };
 
+  const initialBlocks = normalizeBlocks(note.blocks);
   const [currentNote, setCurrentNote] = useState<NoteItem>({ ...note, blocks: initialBlocks });
+  const [history, setHistory] = useState<NoteItem[]>([{ ...note, blocks: initialBlocks }]);
+  const [historyIndex, setHistoryIndex] = useState<number>(0);
+  const [focusedBlockIndex, setFocusedBlockIndex] = useState<number | null>(null);
+  const [activeTableCell, setActiveTableCell] = useState<{ blockIndex: number; rowIndex: number; colIndex: number } | null>(null);
   const [activeToolbarTab, setActiveToolbarTab] = useState<'text' | 'lists' | 'quotes' | 'table' | 'objects'>('text');
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [showToc, setShowToc] = useState<boolean>(false);
+  const [keyboardInset, setKeyboardInset] = useState<number>(0);
+  const [isEditorActive, setIsEditorActive] = useState<boolean>(false);
+  const [activeFormats, setActiveFormats] = useState<{
+    bold: boolean;
+    italic: boolean;
+    underline: boolean;
+    strike: boolean;
+    code: boolean;
+    spoiler: boolean;
+  }>({
+    bold: false,
+    italic: false,
+    underline: false,
+    strike: false,
+    code: false,
+    spoiler: false,
+  });
+  const [botPromptModal, setBotPromptModal] = useState<{ isOpen: boolean; botUsername: string }>({
+    isOpen: false,
+    botUsername: '',
+  });
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const blockElementRefs = useRef<Record<string, HTMLElement | null>>({});
+  const historyTimerRef = useRef<number | null>(null);
+  const flipPositionsRef = useRef<Map<string, number>>(new Map());
+
+  useLayoutEffect(() => {
+    if (flipPositionsRef.current.size === 0) return;
+    const prevPositions = flipPositionsRef.current;
+    flipPositionsRef.current = new Map();
+
+    const container = scrollContainerRef.current;
+    const scrollOffset = container ? container.scrollTop : 0;
+
+    currentNote.blocks.forEach((b) => {
+      const oldTop = prevPositions.get(b.id);
+      const el = blockElementRefs.current[b.id];
+      if (oldTop !== undefined && el) {
+        const newTop = el.getBoundingClientRect().top + scrollOffset;
+        const delta = oldTop - newTop;
+        if (Math.abs(delta) > 0.5) {
+          el.animate(
+            [
+              { transform: `translate3d(0, ${delta}px, 0)` },
+              { transform: 'translate3d(0, 0, 0)' },
+            ],
+            {
+              duration: 260,
+              easing: 'cubic-bezier(0.34, 1.35, 0.64, 1)',
+            }
+          );
+        }
+      }
+    });
+  }, [currentNote.blocks]);
 
   const triggerHaptic = (style: 'light' | 'medium' = 'light') => {
     window.Telegram?.WebApp?.HapticFeedback?.impactOccurred(style);
+  };
+
+  useLayoutEffect(() => {
+    if (flipPositionsRef.current.size === 0) return;
+    const prevPositions = flipPositionsRef.current;
+    flipPositionsRef.current = new Map();
+
+    currentNote.blocks.forEach((b) => {
+      const oldTop = prevPositions.get(b.id);
+      const el = blockElementRefs.current[b.id];
+      if (oldTop !== undefined && el) {
+        const newTop = el.getBoundingClientRect().top;
+        const delta = oldTop - newTop;
+        if (Math.abs(delta) > 0.5) {
+          el.animate(
+            [
+              { transform: `translate3d(0, ${delta}px, 0)` },
+              { transform: 'translate3d(0, 0, 0)' },
+            ],
+            {
+              duration: 260,
+              easing: 'cubic-bezier(0.34, 1.35, 0.64, 1)',
+            }
+          );
+        }
+      }
+    });
+  }, [currentNote.blocks]);
+
+
+  const isMovingRef = useRef<boolean>(false);
+
+  
+
+  const updateActiveFormats = useCallback(() => {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) {
+      setActiveFormats({
+        bold: false,
+        italic: false,
+        underline: false,
+        strike: false,
+        code: false,
+        spoiler: false,
+      });
+      return;
+    }
+    let parentNode: Node | null = sel.anchorNode;
+    if (parentNode && parentNode.nodeType === Node.TEXT_NODE) {
+      parentNode = parentNode.parentNode;
+    }
+    const parentEl = parentNode as HTMLElement | null;
+    setActiveFormats({
+      bold: document.queryCommandState('bold'),
+      italic: document.queryCommandState('italic'),
+      underline: document.queryCommandState('underline'),
+      strike: document.queryCommandState('strikeThrough'),
+      code: Boolean(parentEl?.closest('code')),
+      spoiler: Boolean(parentEl?.closest('tg-spoiler')),
+    });
+  }, []);
+
+  useEffect(() => {
+    const handleViewport = () => {
+      if (window.visualViewport) {
+        const offset = Math.max(0, window.innerHeight - window.visualViewport.height);
+        setKeyboardInset(offset);
+      }
+    };
+
+    const handleFocusIn = (e: FocusEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[contenteditable="true"]') || target?.tagName === 'TEXTAREA' || target?.tagName === 'INPUT') {
+        setIsEditorActive(true);
+      }
+    };
+
+    const handleFocusOut = (e: FocusEvent) => {
+      const related = e.relatedTarget as HTMLElement | null;
+      if (!related?.closest('[data-format-bar="true"]')) {
+        setTimeout(() => {
+          const active = document.activeElement as HTMLElement | null;
+          if (!active?.closest('[contenteditable="true"]') && active?.tagName !== 'TEXTAREA' && active?.tagName !== 'INPUT') {
+            setIsEditorActive(false);
+          }
+        }, 120);
+      }
+    };
+
+    window.visualViewport?.addEventListener('resize', handleViewport);
+    window.visualViewport?.addEventListener('scroll', handleViewport);
+    document.addEventListener('selectionchange', updateActiveFormats);
+    document.addEventListener('focusin', handleFocusIn);
+    document.addEventListener('focusout', handleFocusOut);
+
+    return () => {
+      window.visualViewport?.removeEventListener('resize', handleViewport);
+      window.visualViewport?.removeEventListener('scroll', handleViewport);
+      document.removeEventListener('selectionchange', updateActiveFormats);
+      document.removeEventListener('focusin', handleFocusIn);
+      document.removeEventListener('focusout', handleFocusOut);
+    };
+  }, [updateActiveFormats]);
+
+  const applyFormatCommand = (command: 'bold' | 'italic' | 'underline' | 'strikeThrough') => {
+    triggerHaptic('light');
+    document.execCommand(command, false);
+    if (focusedBlockIndex !== null && currentNote.blocks[focusedBlockIndex]) {
+      const currentEl = blockElementRefs.current[currentNote.blocks[focusedBlockIndex].id];
+      const editableDiv = currentEl?.querySelector('[contenteditable]');
+      if (editableDiv) {
+        updateBlock(
+          focusedBlockIndex,
+          { ...currentNote.blocks[focusedBlockIndex], text: editableDiv.innerHTML } as ContentBlock,
+          true
+        );
+      }
+    }
+    updateActiveFormats();
+  };
+
+  const toggleCustomTag = (tagName: 'tg-spoiler' | 'code') => {
+    triggerHaptic('light');
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+    const range = sel.getRangeAt(0);
+    let parentNode: Node | null = range.commonAncestorContainer;
+    if (parentNode.nodeType === Node.TEXT_NODE) {
+      parentNode = parentNode.parentNode;
+    }
+    const existing = (parentNode as HTMLElement)?.closest(tagName);
+    if (existing) {
+      const parent = existing.parentNode;
+      while (existing.firstChild) {
+        parent?.insertBefore(existing.firstChild, existing);
+      }
+      parent?.removeChild(existing);
+    } else {
+      const el = document.createElement(tagName);
+      try {
+        range.surroundContents(el);
+      } catch (err) {
+        const fragment = range.extractContents();
+        el.appendChild(fragment);
+        range.insertNode(el);
+      }
+      sel.removeAllRanges();
+      const nextRange = document.createRange();
+      nextRange.selectNodeContents(el);
+      sel.addRange(nextRange);
+    }
+    if (focusedBlockIndex !== null && currentNote.blocks[focusedBlockIndex]) {
+      const currentEl = blockElementRefs.current[currentNote.blocks[focusedBlockIndex].id];
+      const editableDiv = currentEl?.querySelector('[contenteditable]');
+      if (editableDiv) {
+        updateBlock(
+          focusedBlockIndex,
+          { ...currentNote.blocks[focusedBlockIndex], text: editableDiv.innerHTML } as ContentBlock,
+          true
+        );
+      }
+    }
+    updateActiveFormats();
+  };
+
+  const handleClearFormatting = () => {
+    triggerHaptic('medium');
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+    document.execCommand('removeFormat', false);
+    const range = sel.getRangeAt(0);
+    let container: Node | null = range.commonAncestorContainer;
+    if (container.nodeType === Node.TEXT_NODE) {
+      container = container.parentNode;
+    }
+    const parentEl = container as HTMLElement | null;
+    const tagsToRemove = ['TG-SPOILER', 'CODE', 'B', 'STRONG', 'I', 'EM', 'U', 'INS', 'S', 'STRIKE', 'DEL'];
+    tagsToRemove.forEach((tag) => {
+      const el = parentEl?.closest(tag);
+      if (el && range.intersectsNode(el)) {
+        const parent = el.parentNode;
+        while (el.firstChild) {
+          parent?.insertBefore(el.firstChild, el);
+        }
+        parent?.removeChild(el);
+      }
+    });
+    if (parentEl) {
+      const descendants = parentEl.querySelectorAll('tg-spoiler, code, b, strong, i, em, u, ins, s, strike, del');
+      descendants.forEach((el) => {
+        if (range.intersectsNode(el)) {
+          const parent = el.parentNode;
+          while (el.firstChild) {
+            parent?.insertBefore(el.firstChild, el);
+          }
+          parent?.removeChild(el);
+        }
+      });
+    }
+    if (focusedBlockIndex !== null && currentNote.blocks[focusedBlockIndex]) {
+      const currentEl = blockElementRefs.current[currentNote.blocks[focusedBlockIndex].id];
+      const editableDiv = currentEl?.querySelector('[contenteditable]');
+      if (editableDiv) {
+        updateBlock(
+          focusedBlockIndex,
+          { ...currentNote.blocks[focusedBlockIndex], text: editableDiv.innerHTML } as ContentBlock,
+          true
+        );
+      }
+    }
+    updateActiveFormats();
   };
 
   useEffect(() => {
@@ -43,7 +363,6 @@ export const EditorView: React.FC<EditorViewProps> = ({
         onBack();
       };
       tg.BackButton.onClick(handleNativeBack);
-
       return () => {
         tg.BackButton.offClick(handleNativeBack);
         tg.BackButton.hide();
@@ -56,30 +375,107 @@ export const EditorView: React.FC<EditorViewProps> = ({
     el.style.height = `${el.scrollHeight}px`;
   };
 
-  const persistChange = (updated: NoteItem) => {
+  const persistChange = (updated: NoteItem, immediateHistory: boolean = false) => {
     const safeBlocks = updated.blocks.length === 0
       ? [{ id: `p-${Date.now()}`, type: 'paragraph', text: '' } as ContentBlock]
       : updated.blocks;
-
     const finalized = { ...updated, blocks: safeBlocks };
     setCurrentNote(finalized);
     onSave(finalized);
+
+    if (immediateHistory) {
+      if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
+      setHistory((prev) => {
+        const next = prev.slice(0, historyIndex + 1);
+        const trimmed = [...next, finalized];
+        if (trimmed.length > 40) trimmed.shift();
+        return trimmed;
+      });
+      setHistoryIndex((prev) => Math.min(prev + 1, 39));
+    } else {
+      if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
+      historyTimerRef.current = window.setTimeout(() => {
+        setHistory((prev) => {
+          const next = prev.slice(0, historyIndex + 1);
+          const trimmed = [...next, finalized];
+          if (trimmed.length > 40) trimmed.shift();
+          return trimmed;
+        });
+        setHistoryIndex((prev) => Math.min(prev + 1, 39));
+      }, 700);
+    }
+  };
+
+  const handleUndo = () => {
+    if (historyIndex > 0) {
+      triggerHaptic('light');
+      const targetIndex = historyIndex - 1;
+      const target = history[targetIndex];
+      setHistoryIndex(targetIndex);
+      setCurrentNote(target);
+      onSave(target);
+    }
+  };
+
+  const handleRedo = () => {
+    if (historyIndex < history.length - 1) {
+      triggerHaptic('light');
+      const targetIndex = historyIndex + 1;
+      const target = history[targetIndex];
+      setHistoryIndex(targetIndex);
+      setCurrentNote(target);
+      onSave(target);
+    }
   };
 
   const handleTitleChange = (title: string) => {
-    persistChange({ ...currentNote, title });
+    persistChange({ ...currentNote, title }, false);
   };
 
-  const updateBlock = (index: number, newBlock: ContentBlock) => {
+  const updateBlock = (index: number, newBlock: ContentBlock, immediateHistory: boolean = false) => {
     const nextBlocks = [...currentNote.blocks];
     nextBlocks[index] = newBlock;
-    persistChange({ ...currentNote, blocks: nextBlocks });
+    persistChange({ ...currentNote, blocks: nextBlocks }, immediateHistory);
   };
 
   const removeBlock = (index: number) => {
     triggerHaptic('medium');
     const filtered = currentNote.blocks.filter((_, i) => i !== index);
-    persistChange({ ...currentNote, blocks: filtered });
+    persistChange({ ...currentNote, blocks: filtered }, true);
+    setFocusedBlockIndex(null);
+  };
+
+  const moveBlock = (index: number, direction: 'up' | 'down') => {
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= currentNote.blocks.length) return;
+    triggerHaptic('light');
+
+    const container = scrollContainerRef.current;
+    const scrollOffset = container ? container.scrollTop : 0;
+    const positions = new Map<string, number>();
+
+    currentNote.blocks.forEach((b) => {
+      const el = blockElementRefs.current[b.id];
+      if (el) {
+        positions.set(b.id, el.getBoundingClientRect().top + scrollOffset);
+      }
+    });
+    flipPositionsRef.current = positions;
+
+    const nextBlocks = [...currentNote.blocks];
+    const temp = nextBlocks[index];
+    nextBlocks[index] = nextBlocks[targetIndex];
+    nextBlocks[targetIndex] = temp;
+
+    if (activeTableCell && activeTableCell.blockIndex === index) {
+      setActiveTableCell({
+        ...activeTableCell,
+        blockIndex: targetIndex,
+      });
+    }
+
+    persistChange({ ...currentNote, blocks: nextBlocks }, true);
+    setFocusedBlockIndex(targetIndex);
   };
 
   const appendBlockWithParagraph = (
@@ -124,11 +520,11 @@ export const EditorView: React.FC<EditorViewProps> = ({
           cells: [
             [
               { text: 'A', is_header: true, align: 'left' },
-              { text: 'B', is_header: true, align: 'right' },
+              { text: 'B', is_header: true, align: 'left' },
             ],
             [
               { text: '', align: 'left' },
-              { text: '', align: 'right' },
+              { text: '', align: 'left' },
             ],
           ],
         };
@@ -153,16 +549,24 @@ export const EditorView: React.FC<EditorViewProps> = ({
       text: '',
     };
 
-    const nextBlocks =
-      type === 'paragraph'
-        ? [...currentNote.blocks, primaryBlock]
-        : [...currentNote.blocks, primaryBlock, trailingParagraph];
+    const targetIndex = focusedBlockIndex !== null && focusedBlockIndex >= 0 && focusedBlockIndex < currentNote.blocks.length
+      ? focusedBlockIndex + 1
+      : currentNote.blocks.length;
 
-    persistChange({ ...currentNote, blocks: nextBlocks });
+    const insertedBlocks = type === 'paragraph' ? [primaryBlock] : [primaryBlock, trailingParagraph];
+    const nextBlocks = [
+      ...currentNote.blocks.slice(0, targetIndex),
+      ...insertedBlocks,
+      ...currentNote.blocks.slice(targetIndex),
+    ];
+
+    persistChange({ ...currentNote, blocks: nextBlocks }, true);
+    setFocusedBlockIndex(targetIndex);
+
     setTimeout(() => {
-      scrollContainerRef.current?.scrollTo({
-        top: scrollContainerRef.current.scrollHeight,
+      blockElementRefs.current[bId1]?.scrollIntoView({
         behavior: 'smooth',
+        block: 'nearest',
       });
     }, 60);
   };
@@ -171,54 +575,94 @@ export const EditorView: React.FC<EditorViewProps> = ({
     triggerHaptic('light');
     const tableBlock = currentNote.blocks[tableIndex];
     if (tableBlock.type !== 'table') return;
-
     const columnCount = tableBlock.cells[0]?.length || 2;
-    const newRow: TableCell[] = Array.from({ length: columnCount }, () => ({ text: '', align: 'left' }));
-    updateBlock(tableIndex, { ...tableBlock, cells: [...tableBlock.cells, newRow] });
+    const newRow: TableCell[] = Array.from({ length: columnCount }, (_, i) => ({
+      text: '',
+      align: tableBlock.cells[0]?.[i]?.align || 'left',
+    }));
+    updateBlock(tableIndex, { ...tableBlock, cells: [...tableBlock.cells, newRow] }, true);
   };
 
-  const removeTableRow = (tableIndex: number) => {
+  const removeTableRow = (tableIndex: number, targetRowIndex?: number) => {
     triggerHaptic('light');
     const tableBlock = currentNote.blocks[tableIndex];
     if (tableBlock.type !== 'table' || tableBlock.cells.length <= 1) return;
-
-    const updatedCells = tableBlock.cells.slice(0, -1);
-    updateBlock(tableIndex, { ...tableBlock, cells: updatedCells });
+    const removeIdx = targetRowIndex !== undefined && targetRowIndex >= 0 && targetRowIndex < tableBlock.cells.length
+      ? targetRowIndex
+      : tableBlock.cells.length - 1;
+    const updatedCells = tableBlock.cells.filter((_, idx) => idx !== removeIdx);
+    if (removeIdx === 0 && updatedCells.length > 0) {
+      updatedCells[0] = updatedCells[0].map((cell) => ({ ...cell, is_header: true }));
+    }
+    updateBlock(tableIndex, { ...tableBlock, cells: updatedCells }, true);
+    if (activeTableCell && activeTableCell.blockIndex === tableIndex) {
+      setActiveTableCell({
+        ...activeTableCell,
+        rowIndex: Math.min(activeTableCell.rowIndex, updatedCells.length - 1),
+      });
+    }
   };
 
   const addTableColumn = (tableIndex: number) => {
     triggerHaptic('light');
     const tableBlock = currentNote.blocks[tableIndex];
     if (tableBlock.type !== 'table') return;
-
     const updatedCells = tableBlock.cells.map((row, rIdx) => [
       ...row,
       { text: '', is_header: rIdx === 0, align: 'left' as const },
     ]);
-    updateBlock(tableIndex, { ...tableBlock, cells: updatedCells });
+    updateBlock(tableIndex, { ...tableBlock, cells: updatedCells }, true);
   };
 
-  const removeTableColumn = (tableIndex: number) => {
+  const removeTableColumn = (tableIndex: number, targetColIndex?: number) => {
     triggerHaptic('light');
     const tableBlock = currentNote.blocks[tableIndex];
     if (tableBlock.type !== 'table' || (tableBlock.cells[0]?.length || 0) <= 1) return;
-
-    const updatedCells = tableBlock.cells.map((row) => row.slice(0, -1));
-    updateBlock(tableIndex, { ...tableBlock, cells: updatedCells });
+    const removeIdx = targetColIndex !== undefined && targetColIndex >= 0 && targetColIndex < (tableBlock.cells[0]?.length || 0)
+      ? targetColIndex
+      : (tableBlock.cells[0]?.length || 0) - 1;
+    const updatedCells = tableBlock.cells.map((row) => row.filter((_, idx) => idx !== removeIdx));
+    updateBlock(tableIndex, { ...tableBlock, cells: updatedCells }, true);
+    if (activeTableCell && activeTableCell.blockIndex === tableIndex) {
+      setActiveTableCell({
+        ...activeTableCell,
+        colIndex: Math.min(activeTableCell.colIndex, (updatedCells[0]?.length || 1) - 1),
+      });
+    }
   };
 
   const toggleTableBorder = (tableIndex: number) => {
     triggerHaptic('light');
     const tableBlock = currentNote.blocks[tableIndex];
     if (tableBlock.type !== 'table') return;
-    updateBlock(tableIndex, { ...tableBlock, is_bordered: !tableBlock.is_bordered });
+    updateBlock(tableIndex, { ...tableBlock, is_bordered: !tableBlock.is_bordered }, true);
   };
 
   const toggleTableStriped = (tableIndex: number) => {
     triggerHaptic('light');
     const tableBlock = currentNote.blocks[tableIndex];
     if (tableBlock.type !== 'table') return;
-    updateBlock(tableIndex, { ...tableBlock, is_striped: !tableBlock.is_striped });
+    updateBlock(tableIndex, { ...tableBlock, is_striped: !tableBlock.is_striped }, true);
+  };
+
+  const setCellAlignment = (blockIndex: number, rowIndex: number, colIndex: number, align: 'left' | 'center' | 'right') => {
+    triggerHaptic('light');
+    const tableBlock = currentNote.blocks[blockIndex];
+    if (tableBlock.type !== 'table') return;
+    const nextCells = tableBlock.cells.map((row, rI) =>
+      row.map((cell, cI) => (rI === rowIndex && cI === colIndex ? { ...cell, align } : cell))
+    );
+    updateBlock(blockIndex, { ...tableBlock, cells: nextCells }, true);
+  };
+
+  const setColumnAlignment = (blockIndex: number, colIndex: number, align: 'left' | 'center' | 'right') => {
+    triggerHaptic('light');
+    const tableBlock = currentNote.blocks[blockIndex];
+    if (tableBlock.type !== 'table') return;
+    const nextCells = tableBlock.cells.map((row) =>
+      row.map((cell, cI) => (cI === colIndex ? { ...cell, align } : cell))
+    );
+    updateBlock(blockIndex, { ...tableBlock, cells: nextCells }, true);
   };
 
   const scrollToHeading = (id: string) => {
@@ -234,6 +678,49 @@ export const EditorView: React.FC<EditorViewProps> = ({
     (b): b is Extract<ContentBlock, { type: 'heading' }> => b.type === 'heading' && b.text.trim().length > 0
   );
 
+  const executeExport = async (payload: any) => {
+    const result = await exportNoteToTelegram(payload);
+    if (result.success) {
+      window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('success');
+      setExportNotice(t('exported'));
+      setIsExporting(false);
+      setTimeout(() => setExportNotice(null), 2500);
+      return;
+    }
+
+    if (result.error === 'NEED_START_BOT') {
+      setIsExporting(false);
+      setBotPromptModal({ isOpen: true, botUsername: result.bot_username || '' });
+      return;
+    }
+
+    if (result.error === 'NEED_WRITE_ACCESS' && window.Telegram?.WebApp?.requestWriteAccess) {
+      window.Telegram.WebApp.requestWriteAccess(async (allowed: boolean) => {
+        if (allowed) {
+          const retryResult = await exportNoteToTelegram(payload);
+          if (retryResult.success) {
+            window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('success');
+            setExportNotice(t('exported'));
+          } else {
+            window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
+            setExportNotice(t('export_failed'));
+          }
+        } else {
+          window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
+          setExportNotice(t('export_failed'));
+        }
+        setIsExporting(false);
+        setTimeout(() => setExportNotice(null), 2500);
+      });
+      return;
+    }
+
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
+    setExportNotice(t('export_failed'));
+    setIsExporting(false);
+    setTimeout(() => setExportNotice(null), 2500);
+  };
+
   const handleExport = async () => {
     triggerHaptic('medium');
     setIsExporting(true);
@@ -247,7 +734,9 @@ export const EditorView: React.FC<EditorViewProps> = ({
       if (b.type === 'heading') {
         richBlocks.push({ type: 'heading', size: b.size, text: b.text });
       } else if (b.type === 'paragraph') {
-        if (b.text.trim()) richBlocks.push({ type: 'paragraph', text: b.text });
+        if (b.text && b.text.trim()) {
+          richBlocks.push({ type: 'paragraph', text: b.text });
+        }
       } else if (b.type === 'quote') {
         richBlocks.push({
           type: 'blockquote',
@@ -302,42 +791,50 @@ export const EditorView: React.FC<EditorViewProps> = ({
       ...currentNote,
       blocks: richBlocks as any,
     };
-    onSave(exportPayload);
 
-    const success = await exportNoteToTelegram(exportPayload);
-    setIsExporting(false);
-    if (success) {
-      window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('success');
-      setExportNotice(t('exported'));
-    } else {
-      window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
-      setExportNotice(t('export_failed'));
-    }
-    setTimeout(() => setExportNotice(null), 2500);
+    await executeExport(exportPayload);
   };
 
   return (
     <div
       ref={scrollContainerRef}
-      className="flex flex-col w-full h-full overflow-y-auto px-6 animate-page-fade relative"
+      className="flex flex-col w-full h-full overflow-y-auto overflow-x-hidden px-6 animate-page-fade relative"
       style={{ paddingBottom: 'calc(var(--keyboard-inset, 0px) + 5rem)' }}
     >
       <div className="sticky top-0 z-30 bg-[#FAF8F5]/95 safe-header-box pb-2 border-b border-cream-divider flex flex-col gap-2">
         <div className="flex items-center justify-between">
-          <button
-            onClick={() => {
-              triggerHaptic();
-              setShowToc(!showToc);
-            }}
-            className={`h-7 px-2.5 rounded-full border text-xs font-medium flex items-center gap-1 physics-bounce ${
-              showToc
-                ? 'bg-warm-accent text-white border-warm-accent'
-                : 'bg-cream-surface text-warm-text border-cream-divider'
-            }`}
-          >
-            <span className="material-symbols-outlined text-[15px]">toc</span>
-            <span>{t('toc_title')}</span>
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => {
+                triggerHaptic();
+                setShowToc(!showToc);
+              }}
+              className={`h-7 px-2.5 rounded-full border text-xs font-medium flex items-center gap-1 physics-bounce ${
+                showToc
+                  ? 'bg-warm-accent text-white border-warm-accent'
+                  : 'bg-cream-surface text-warm-text border-cream-divider'
+              }`}
+            >
+              <span className="material-symbols-outlined text-[15px]">toc</span>
+              <span>{t('toc_title')}</span>
+            </button>
+            <div className="flex items-center bg-cream-surface rounded-full border border-cream-divider px-0.5">
+              <button
+                onClick={handleUndo}
+                disabled={historyIndex <= 0}
+                className="w-6 h-6 flex items-center justify-center text-warm-text disabled:opacity-30 physics-bounce"
+              >
+                <span className="material-symbols-outlined text-[15px]">undo</span>
+              </button>
+              <button
+                onClick={handleRedo}
+                disabled={historyIndex >= history.length - 1}
+                className="w-6 h-6 flex items-center justify-center text-warm-text disabled:opacity-30 physics-bounce"
+              >
+                <span className="material-symbols-outlined text-[15px]">redo</span>
+              </button>
+            </div>
+          </div>
 
           <div className="flex items-center gap-1.5">
             <button
@@ -357,7 +854,6 @@ export const EditorView: React.FC<EditorViewProps> = ({
                 </>
               )}
             </button>
-
             <button
               onClick={() => {
                 triggerHaptic('medium');
@@ -378,7 +874,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
               key={cat.id}
               onClick={() => {
                 triggerHaptic();
-                persistChange({ ...currentNote, category: cat.id });
+                persistChange({ ...currentNote, category: cat.id }, true);
               }}
               className={`text-[10px] px-2.5 py-0.5 rounded font-medium uppercase tracking-wider shrink-0 transition-colors ${
                 currentNote.category === cat.id
@@ -424,7 +920,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
               >
                 <span>{t('tool_paragraph')}</span>
               </button>
-              {([2, 3, 4, 5, 6] as const).map((lvl) => (
+              {([1, 2, 3, 4, 5, 6] as const).map((lvl) => (
                 <button
                   key={lvl}
                   onClick={() => appendBlockWithParagraph('heading', { size: lvl })}
@@ -539,26 +1035,31 @@ export const EditorView: React.FC<EditorViewProps> = ({
             </button>
           </div>
           <div className="flex flex-col gap-1.5 pt-2 max-h-48 overflow-y-auto">
-            {headingsList.length === 0 ? (
-              <span className="text-xs text-warm-subtle italic">{t('toc_empty')}</span>
-            ) : (
-              headingsList.map((hBlock) => (
-                <button
-                  key={hBlock.id}
-                  onClick={() => scrollToHeading(hBlock.id)}
-                  className={`text-left text-xs text-warm-text hover:text-warm-accent transition-colors truncate ${
-                    hBlock.size === 2
-                      ? 'pl-2 font-semibold'
-                      : hBlock.size === 3
-                      ? 'pl-4 font-medium'
-                      : 'pl-6 text-warm-muted'
-                  }`}
-                >
-                  {hBlock.text}
-                </button>
-              ))
-            )}
-          </div>
+                {headingsList.length === 0 ? (
+                  <span className="text-xs text-warm-subtle italic">{t('toc_empty')}</span>
+                ) : (
+                  headingsList.map((hBlock) => {
+                    const indentStyles: Record<number, string> = {
+                      1: 'pl-1 text-[13px] font-bold text-warm-text',
+                      2: 'pl-3 text-xs font-semibold text-warm-text',
+                      3: 'pl-5 text-xs font-medium text-warm-text',
+                      4: 'pl-7 text-xs font-normal text-warm-muted',
+                      5: 'pl-9 text-[11px] font-normal text-warm-muted',
+                      6: 'pl-11 text-[11px] font-normal text-warm-subtle',
+                    };
+                    const styleClass = indentStyles[hBlock.size] || indentStyles[2];
+                    return (
+                      <button
+                        key={hBlock.id}
+                        onClick={() => scrollToHeading(hBlock.id)}
+                        className={`text-left transition-colors truncate hover:text-warm-accent ${styleClass}`}
+                      >
+                        {hBlock.text}
+                      </button>
+                    );
+                  })
+                )}
+              </div>
         </div>
       )}
 
@@ -567,29 +1068,29 @@ export const EditorView: React.FC<EditorViewProps> = ({
           rows={1}
           value={currentNote.title}
           placeholder={t('title_placeholder')}
+          onFocus={() => setFocusedBlockIndex(null)}
           onInput={(e) => autoResize(e.currentTarget)}
           onChange={(e) => handleTitleChange(e.target.value)}
           className="text-2xl font-bold tracking-tight text-warm-text bg-transparent border-none focus:outline-none placeholder:text-warm-subtle w-full mb-3 resize-none overflow-hidden"
         />
 
-        <div className="flex flex-col gap-2.5 min-h-[300px]">
+        <div className="flex flex-col gap-2.5 min-h-[300px] w-full min-w-0">
           {currentNote.blocks.map((block, index) => (
             <div
               key={block.id}
               ref={(el) => {
                 blockElementRefs.current[block.id] = el;
               }}
-              className="relative group flex items-start gap-1 animate-block-enter"
+              className="relative group flex items-start gap-1 w-full min-w-0"
             >
-              <div className="flex-1">
+              <div className="flex-1 min-w-0 w-full">
                 {block.type === 'paragraph' && (
-                  <textarea
-                    rows={1}
-                    value={block.text}
+                  <EditableBlock
+                    html={block.text}
                     placeholder={t('paragraph_placeholder')}
-                    onInput={(e) => autoResize(e.currentTarget)}
-                    onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
-                    className="w-full text-[15px] leading-relaxed text-warm-text bg-transparent border-none focus:outline-none placeholder:text-warm-subtle resize-none overflow-hidden"
+                    onFocus={() => setFocusedBlockIndex(index)}
+                    onChange={(newHtml) => updateBlock(index, { ...block, text: newHtml })}
+                    className="w-full text-[15px] leading-relaxed text-warm-text bg-transparent border-none focus:outline-none min-h-[24px]"
                   />
                 )}
 
@@ -598,6 +1099,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                     type="text"
                     value={block.text}
                     placeholder={`${t('heading_placeholder')} (H${block.size})`}
+                    onFocus={() => setFocusedBlockIndex(index)}
                     onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
                     className={`w-full font-semibold tracking-tight text-warm-text bg-transparent border-none focus:outline-none placeholder:text-warm-subtle pt-0.5 ${
                       block.size === 1
@@ -617,6 +1119,10 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       rows={1}
                       value={block.text}
                       placeholder={t('quote_placeholder')}
+                      ref={(el) => {
+                        if (el) autoResize(el);
+                      }}
+                      onFocus={() => setFocusedBlockIndex(index)}
                       onInput={(e) => autoResize(e.currentTarget)}
                       onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
                       className="w-full text-[15px] italic text-[#4A3828] bg-transparent border-none focus:outline-none resize-none overflow-hidden"
@@ -625,6 +1131,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       type="text"
                       value={block.credit || ''}
                       placeholder={t('quote_credit_placeholder')}
+                      onFocus={() => setFocusedBlockIndex(index)}
                       onChange={(e) => updateBlock(index, { ...block, credit: e.target.value })}
                       className="w-full text-xs font-medium text-warm-accent bg-transparent border-none focus:outline-none"
                     />
@@ -637,6 +1144,10 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       rows={1}
                       value={block.text}
                       placeholder={t('quote_placeholder')}
+                      ref={(el) => {
+                        if (el) autoResize(el);
+                      }}
+                      onFocus={() => setFocusedBlockIndex(index)}
                       onInput={(e) => autoResize(e.currentTarget)}
                       onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
                       className="w-full text-[15px] italic text-warm-text bg-transparent border-none focus:outline-none resize-none overflow-hidden"
@@ -645,6 +1156,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       type="text"
                       value={block.credit || ''}
                       placeholder={t('quote_credit_placeholder')}
+                      onFocus={() => setFocusedBlockIndex(index)}
                       onChange={(e) => updateBlock(index, { ...block, credit: e.target.value })}
                       className="w-full text-xs font-medium text-warm-accent bg-transparent border-none focus:outline-none"
                     />
@@ -657,6 +1169,10 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       rows={1}
                       value={block.text}
                       placeholder={t('quote_placeholder')}
+                      ref={(el) => {
+                        if (el) autoResize(el);
+                      }}
+                      onFocus={() => setFocusedBlockIndex(index)}
                       onInput={(e) => autoResize(e.currentTarget)}
                       onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
                       className="w-full text-base font-serif italic text-warm-text text-center bg-transparent border-none focus:outline-none resize-none overflow-hidden"
@@ -665,6 +1181,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       type="text"
                       value={block.credit || ''}
                       placeholder={t('quote_credit_placeholder')}
+                      onFocus={() => setFocusedBlockIndex(index)}
                       onChange={(e) => updateBlock(index, { ...block, credit: e.target.value })}
                       className="w-full text-xs font-medium text-warm-accent text-center bg-transparent border-none focus:outline-none"
                     />
@@ -681,7 +1198,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                               triggerHaptic();
                               const newItems = [...block.items];
                               newItems[itemIdx].is_checked = !newItems[itemIdx].is_checked;
-                              updateBlock(index, { ...block, items: newItems });
+                              updateBlock(index, { ...block, items: newItems }, true);
                             }}
                             className={`w-4 h-4 rounded flex items-center justify-center transition-colors ${
                               item.is_checked ? 'bg-[#5F7466] text-white' : 'border border-warm-subtle bg-transparent'
@@ -700,13 +1217,43 @@ export const EditorView: React.FC<EditorViewProps> = ({
                         )}
 
                         <input
+                          id={item.id}
                           type="text"
                           value={item.text}
                           placeholder={t('task_placeholder')}
+                          onFocus={() => setFocusedBlockIndex(index)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              triggerHaptic('light');
+                              const newTaskId = `task-${Date.now()}`;
+                              const newItems = [...block.items];
+                              newItems.splice(itemIdx + 1, 0, {
+                                id: newTaskId,
+                                text: '',
+                                is_checked: false,
+                              });
+                              updateBlock(index, { ...block, items: newItems }, true);
+                              setTimeout(() => {
+                                document.getElementById(newTaskId)?.focus();
+                              }, 50);
+                            } else if (e.key === 'Backspace' && item.text === '' && block.items.length > 1) {
+                              e.preventDefault();
+                              triggerHaptic('light');
+                              const newItems = block.items.filter((_, i) => i !== itemIdx);
+                              updateBlock(index, { ...block, items: newItems }, true);
+                              const prevItem = block.items[itemIdx - 1];
+                              if (prevItem) {
+                                setTimeout(() => {
+                                  document.getElementById(prevItem.id)?.focus();
+                                }, 50);
+                              }
+                            }
+                          }}
                           onChange={(e) => {
                             const newItems = [...block.items];
                             newItems[itemIdx].text = e.target.value;
-                            updateBlock(index, { ...block, items: newItems });
+                            updateBlock(index, { ...block, items: newItems }, false);
                           }}
                           className={`text-sm bg-transparent border-none focus:outline-none flex-1 ${
                             item.is_checked ? 'line-through text-warm-muted' : 'text-warm-text'
@@ -717,11 +1264,15 @@ export const EditorView: React.FC<EditorViewProps> = ({
                     <button
                       onClick={() => {
                         triggerHaptic();
+                        const newTaskId = `task-${Date.now()}`;
                         const newItems = [
                           ...block.items,
-                          { id: `task-${Date.now()}`, text: '', is_checked: false },
+                          { id: newTaskId, text: '', is_checked: false },
                         ];
-                        updateBlock(index, { ...block, items: newItems });
+                        updateBlock(index, { ...block, items: newItems }, true);
+                        setTimeout(() => {
+                          document.getElementById(newTaskId)?.focus();
+                        }, 50);
                       }}
                       className="text-xs text-warm-accent font-medium self-start flex items-center gap-1 mt-0.5"
                     >
@@ -732,97 +1283,193 @@ export const EditorView: React.FC<EditorViewProps> = ({
                 )}
 
                 {block.type === 'table' && (
-                  <div className="flex flex-col gap-1.5 my-2">
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      <button
-                        onClick={() => addTableRow(index)}
-                        className="text-[10px] px-2.5 py-1 rounded bg-cream-surface text-warm-text font-medium border border-cream-divider/80 physics-bounce"
-                      >
-                        {t('add_row')}
-                      </button>
-                      <button
-                        onClick={() => removeTableRow(index)}
-                        className="text-[10px] px-2.5 py-1 rounded bg-cream-surface text-warm-muted font-medium border border-cream-divider/80 physics-bounce"
-                      >
-                        {t('del_row')}
-                      </button>
-                      <button
-                        onClick={() => addTableColumn(index)}
-                        className="text-[10px] px-2.5 py-1 rounded bg-cream-surface text-warm-text font-medium border border-cream-divider/80 physics-bounce"
-                      >
-                        {t('add_col')}
-                      </button>
-                      <button
-                        onClick={() => removeTableColumn(index)}
-                        className="text-[10px] px-2.5 py-1 rounded bg-cream-surface text-warm-muted font-medium border border-cream-divider/80 physics-bounce"
-                      >
-                        {t('del_col')}
-                      </button>
-                      <button
-                        onClick={() => toggleTableBorder(index)}
-                        className={`text-[10px] px-2.5 py-1 rounded font-medium border transition-colors physics-bounce ${
-                          block.is_bordered
-                            ? 'bg-warm-accent text-white border-warm-accent'
-                            : 'bg-cream-surface text-warm-muted border-cream-divider/80'
+                  <div className="flex flex-col gap-1.5 my-3 w-full min-w-0 max-w-full">
+                    <div
+                      className={`relative w-full min-w-0 max-w-full rounded-xl overflow-hidden bg-[#FAF8F5] transition-all duration-150 ${
+                        block.is_bordered ? 'border border-cream-divider' : 'border border-transparent'
+                      }`}
+                    >
+                      <div
+                        className={`flex items-center justify-between px-2.5 bg-cream-surface transition-all duration-150 ease-out overflow-x-auto no-scrollbar gap-2 ${
+                          block.is_bordered ? 'border-b border-cream-divider' : ''
+                        } ${
+                          focusedBlockIndex === index
+                            ? 'max-h-12 py-1.5 opacity-100'
+                            : 'max-h-0 py-0 opacity-0 pointer-events-none'
                         }`}
                       >
-                        {t('toggle_border')}
-                      </button>
-                      <button
-                        onClick={() => toggleTableStriped(index)}
-                        className={`text-[10px] px-2.5 py-1 rounded font-medium border transition-colors physics-bounce ${
-                          block.is_striped
-                            ? 'bg-warm-accent text-white border-warm-accent'
-                            : 'bg-cream-surface text-warm-muted border-cream-divider/80'
-                        }`}
-                      >
-                        {t('toggle_striped')}
-                      </button>
-                    </div>
+                        <div className="flex items-center gap-1">
+                          {activeTableCell && activeTableCell.blockIndex === index && (
+                            <div className="flex items-center bg-[#FAF8F5] border border-cream-divider rounded-lg p-0.5">
+                              <button
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => setCellAlignment(index, activeTableCell.rowIndex, activeTableCell.colIndex, 'left')}
+                                className="w-6 h-6 flex items-center justify-center rounded text-warm-muted hover:text-warm-text active:scale-90 transition-transform"
+                              >
+                                <span className="material-symbols-outlined text-[14px]">format_align_left</span>
+                              </button>
+                              <button
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => setCellAlignment(index, activeTableCell.rowIndex, activeTableCell.colIndex, 'center')}
+                                className="w-6 h-6 flex items-center justify-center rounded text-warm-muted hover:text-warm-text active:scale-90 transition-transform"
+                              >
+                                <span className="material-symbols-outlined text-[14px]">format_align_center</span>
+                              </button>
+                              <button
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => setCellAlignment(index, activeTableCell.rowIndex, activeTableCell.colIndex, 'right')}
+                                className="w-6 h-6 flex items-center justify-center rounded text-warm-muted hover:text-warm-text active:scale-90 transition-transform"
+                              >
+                                <span className="material-symbols-outlined text-[14px]">format_align_right</span>
+                              </button>
+                            </div>
+                          )}
 
-                    <div className="overflow-x-auto py-1">
-                      <table
-                        className={`w-full text-xs text-left border-collapse rounded-md overflow-hidden ${
-                          block.is_bordered ? 'border-2 border-[#C4B7A6]' : 'border border-cream-divider/40'
-                        }`}
-                      >
-                        <tbody>
-                          {block.cells.map((row, rIdx) => (
-                            <tr
-                              key={rIdx}
-                              className={`${
-                                rIdx === 0
-                                  ? 'bg-[#EFE9E0] font-semibold text-warm-text'
-                                  : block.is_striped && rIdx % 2 === 1
-                                  ? 'bg-[#F5EFE6]'
-                                  : 'bg-white'
+                          <div className="flex items-center gap-0.5">
+                            <button
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => toggleTableBorder(index)}
+                              className={`p-1 rounded-lg transition-colors active:scale-90 ${
+                                block.is_bordered ? 'text-warm-accent bg-warm-accent-light' : 'text-warm-muted hover:text-warm-text'
                               }`}
                             >
-                              {row.map((col, cIdx) => (
-                                <td
-                                  key={cIdx}
-                                  className={`p-1 ${
-                                    block.is_bordered ? 'border border-[#C4B7A6]' : 'border-b border-cream-divider/50'
-                                  }`}
-                                >
-                                  <input
-                                    type="text"
-                                    value={col.text}
-                                    placeholder={`[${rIdx + 1},${cIdx + 1}]`}
-                                    onChange={(e) => {
-                                      const nextCells = block.cells.map((r, ri) =>
-                                        r.map((c, ci) => (ri === rIdx && ci === cIdx ? { ...c, text: e.target.value } : c))
-                                      );
-                                      updateBlock(index, { ...block, cells: nextCells });
-                                    }}
-                                    className="w-full bg-transparent border-none focus:outline-none text-warm-text p-1 font-medium"
+                              <span className="material-symbols-outlined text-[15px]">border_all</span>
+                            </button>
+                            <button
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => toggleTableStriped(index)}
+                              className={`p-1 rounded-lg transition-colors active:scale-90 ${
+                                block.is_striped ? 'text-warm-accent bg-warm-accent-light' : 'text-warm-muted hover:text-warm-text'
+                              }`}
+                            >
+                              <span className="material-symbols-outlined text-[15px]">table_rows</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1">
+                          <button
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => removeTableRow(index, activeTableCell?.rowIndex)}
+                            disabled={block.cells.length <= 1}
+                            className="px-2 py-1 rounded-md text-[11px] font-medium text-warm-muted hover:text-red-600 disabled:opacity-30 flex items-center gap-0.5 active:scale-90 transition-transform"
+                          >
+                            <span className="material-symbols-outlined text-[13px]">delete</span>
+                            <span>{t('del_row').replace(/^[+\-–]\s*/, '')}</span>
+                          </button>
+                          <span className="h-3 w-[1px] bg-cream-divider mx-0.5" />
+                          <button
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => removeTableColumn(index, activeTableCell?.colIndex)}
+                            disabled={(block.cells[0]?.length || 0) <= 1}
+                            className="px-2 py-1 rounded-md text-[11px] font-medium text-warm-muted hover:text-red-600 disabled:opacity-30 flex items-center gap-0.5 active:scale-90 transition-transform"
+                          >
+                            <span className="material-symbols-outlined text-[13px]">delete</span>
+                            <span>{t('del_col').replace(/^[+\-–]\s*/, '')}</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="w-full max-w-full overflow-x-auto no-scrollbar scroll-smooth overscroll-x-contain">
+                        <table
+                          className={`text-xs border-collapse ${
+                            (block.cells[0]?.length || 0) <= 2 ? 'w-full table-fixed' : 'w-max min-w-full'
+                          }`}
+                        >
+                          <tbody>
+                            {block.cells.map((row, rIdx) => (
+                              <tr
+                                key={rIdx}
+                                className={`${
+                                  rIdx === 0
+                                    ? `bg-cream-surface/80 font-semibold text-warm-text ${
+                                        block.is_bordered ? 'border-b border-cream-divider' : ''
+                                      }`
+                                    : block.is_striped && rIdx % 2 === 1
+                                    ? 'bg-cream-surface/35'
+                                    : 'bg-transparent'
+                                }`}
+                              >
+                                {row.map((col, cIdx) => (
+                                  <td
+                                    key={cIdx}
+                                    className={`p-0 relative min-w-0 ${
+                                      (block.cells[0]?.length || 0) > 2 ? 'min-w-[100px]' : ''
+                                    } ${
+                                      block.is_bordered
+                                        ? `border-cream-divider ${rIdx < block.cells.length - 1 ? 'border-b' : ''} ${
+                                            cIdx < row.length - 1 ? 'border-r' : ''
+                                          }`
+                                        : 'border-none'
+                                    }`}
+                                  >
+                                    <input
+                                      type="text"
+                                      value={col.text}
+                                      placeholder={rIdx === 0 ? `${t('table_col')} ${cIdx + 1}` : `${t('table_cell')} ${rIdx + 1}`}
+                                      onFocus={() => {
+                                        setFocusedBlockIndex(index);
+                                        setActiveTableCell({ blockIndex: index, rowIndex: rIdx, colIndex: cIdx });
+                                      }}
+                                      onChange={(e) => {
+                                        const nextCells = block.cells.map((r, ri) =>
+                                          r.map((c, ci) => (ri === rIdx && ci === cIdx ? { ...c, text: e.target.value } : c))
+                                        );
+                                        updateBlock(index, { ...block, cells: nextCells }, false);
+                                      }}
+                                      className={`w-full min-w-0 bg-transparent border-none focus:outline-none text-warm-text px-2.5 py-1.5 font-medium ${
+                                        col.align === 'center' ? 'text-center' : col.align === 'right' ? 'text-right' : 'text-left'
+                                      }`}
+                                    />
+                                  </td>
+                                ))}
+                                {rIdx === 0 ? (
+                                  <th
+                                    style={{ width: '32px', minWidth: '32px', maxWidth: '32px' }}
+                                    className={`w-8 min-w-[32px] max-w-[32px] p-0 text-center align-middle ${
+                                      block.is_bordered ? 'border-b border-cream-divider bg-cream-surface/60' : 'bg-cream-surface/30'
+                                    }`}
+                                  >
+                                    <button
+                                      onMouseDown={(e) => e.preventDefault()}
+                                      onClick={() => addTableColumn(index)}
+                                      className="w-full h-full min-h-[30px] flex items-center justify-center text-warm-muted hover:text-warm-accent active:scale-90 transition-transform"
+                                      title={t('add_col').replace(/^[+\-–]\s*/, '')}
+                                    >
+                                      <span className="material-symbols-outlined text-[15px]">add</span>
+                                    </button>
+                                  </th>
+                                ) : (
+                                  <td
+                                    style={{ width: '32px', minWidth: '32px', maxWidth: '32px' }}
+                                    className={`w-8 min-w-[32px] max-w-[32px] p-0 ${
+                                      block.is_bordered && rIdx < block.cells.length - 1 ? 'border-b border-cream-divider/30' : ''
+                                    }`}
                                   />
-                                </td>
-                              ))}
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                                )}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      <div
+                        className={`flex items-center justify-between px-3 py-1 bg-cream-surface/30 ${
+                          block.is_bordered ? 'border-t border-cream-divider' : ''
+                        }`}
+                      >
+                        <button
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => addTableRow(index)}
+                          className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium text-warm-muted hover:text-warm-accent active:scale-90 transition-transform"
+                        >
+                          <span className="material-symbols-outlined text-[14px]">add</span>
+                          <span>{t('add_row').replace(/^[+\-–]\s*/, '')}</span>
+                        </button>
+                        <span className="text-[10px] font-mono text-warm-subtle">
+                          {block.cells.length} × {block.cells[0]?.length || 0}
+                        </span>
+                      </div>
                     </div>
                   </div>
                 )}
@@ -833,6 +1480,10 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       rows={1}
                       value={block.text}
                       placeholder={t('code_placeholder')}
+                      ref={(el) => {
+                        if (el) autoResize(el);
+                      }}
+                      onFocus={() => setFocusedBlockIndex(index)}
                       onInput={(e) => autoResize(e.currentTarget)}
                       onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
                       className="w-full bg-transparent border-none focus:outline-none text-xs text-warm-text font-code resize-none overflow-hidden"
@@ -847,6 +1498,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       type="text"
                       value={block.expression}
                       placeholder={t('math_placeholder')}
+                      onFocus={() => setFocusedBlockIndex(index)}
                       onChange={(e) => updateBlock(index, { ...block, expression: e.target.value })}
                       className="w-full bg-transparent border-none focus:outline-none text-warm-text font-code"
                     />
@@ -860,6 +1512,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       type="text"
                       value={block.summary}
                       placeholder={t('details_summary_placeholder')}
+                      onFocus={() => setFocusedBlockIndex(index)}
                       onChange={(e) => updateBlock(index, { ...block, summary: e.target.value })}
                       className="text-xs font-semibold text-warm-accent bg-transparent border-none focus:outline-none"
                     />
@@ -867,6 +1520,10 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       rows={1}
                       value={block.text}
                       placeholder={t('details_content_placeholder')}
+                      ref={(el) => {
+                        if (el) autoResize(el);
+                      }}
+                      onFocus={() => setFocusedBlockIndex(index)}
                       onInput={(e) => autoResize(e.currentTarget)}
                       onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
                       className="text-xs text-warm-text bg-transparent border-none focus:outline-none resize-none overflow-hidden"
@@ -877,16 +1534,178 @@ export const EditorView: React.FC<EditorViewProps> = ({
                 {block.type === 'divider' && <div className="w-full h-px bg-cream-divider my-2" />}
               </div>
 
-              <button
-                onClick={() => removeBlock(index)}
-                className="w-5 h-5 flex items-center justify-center text-warm-subtle hover:text-red-500 pt-0.5"
-              >
-                <span className="material-symbols-outlined text-[14px]">close</span>
-              </button>
+              {focusedBlockIndex === index && (
+                <div className="absolute right-0 -top-3 z-10 flex items-center gap-1 bg-[#FAF8F5] border border-cream-divider/80 px-1.5 py-0.5 rounded-full shadow-sm animate-page-fade">
+                  <button
+                    onMouseDown={(e) => e.preventDefault()}
+                    onPointerDown={(e) => e.preventDefault()}
+                    onClick={() => moveBlock(index, 'up')}
+                    disabled={index === 0}
+                    className="w-5 h-5 flex items-center justify-center text-warm-muted hover:text-warm-text disabled:opacity-25 physics-bounce"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">arrow_upward</span>
+                  </button>
+                  <button
+                    onMouseDown={(e) => e.preventDefault()}
+                    onPointerDown={(e) => e.preventDefault()}
+                    onClick={() => moveBlock(index, 'down')}
+                    disabled={index === currentNote.blocks.length - 1}
+                    className="w-5 h-5 flex items-center justify-center text-warm-muted hover:text-warm-text disabled:opacity-25 physics-bounce"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">arrow_downward</span>
+                  </button>
+                  <button
+                    onMouseDown={(e) => e.preventDefault()}
+                    onPointerDown={(e) => e.preventDefault()}
+                    onClick={() => removeBlock(index)}
+                    className="w-5 h-5 flex items-center justify-center text-warm-muted hover:text-red-600 physics-bounce"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">delete</span>
+                  </button>
+                </div>
+              )}
             </div>
           ))}
         </div>
       </div>
+
+      {isEditorActive &&
+        createPortal(
+          <div
+            data-format-bar="true"
+            className="fixed inset-x-0 z-50 flex justify-center px-4 pointer-events-none max-w-[420px] mx-auto select-none"
+            style={{
+              bottom: keyboardInset > 0
+                ? `${keyboardInset + 10}px`
+                : 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 12px)',
+            }}
+          >
+            <div className="pointer-events-auto flex items-center p-1 rounded-full bg-cream-surface border border-cream-divider shadow-xl backdrop-blur-md">
+              <button
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => applyFormatCommand('bold')}
+                className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors text-xs font-bold ${
+                  activeFormats.bold
+                    ? 'bg-warm-accent text-[#FAF8F5]'
+                    : 'text-warm-muted hover:text-warm-text active:bg-cream-divider'
+                }`}
+              >
+                B
+              </button>
+              <button
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => applyFormatCommand('italic')}
+                className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors text-xs italic font-serif ${
+                  activeFormats.italic
+                    ? 'bg-warm-accent text-[#FAF8F5]'
+                    : 'text-warm-muted hover:text-warm-text active:bg-cream-divider'
+                }`}
+              >
+                I
+              </button>
+              <button
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => applyFormatCommand('underline')}
+                className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors text-xs underline ${
+                  activeFormats.underline
+                    ? 'bg-warm-accent text-[#FAF8F5]'
+                    : 'text-warm-muted hover:text-warm-text active:bg-cream-divider'
+                }`}
+              >
+                U
+              </button>
+              <button
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => applyFormatCommand('strikeThrough')}
+                className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors text-xs line-through ${
+                  activeFormats.strike
+                    ? 'bg-warm-accent text-[#FAF8F5]'
+                    : 'text-warm-muted hover:text-warm-text active:bg-cream-divider'
+                }`}
+              >
+                S
+              </button>
+              <div className="w-[1px] h-4 bg-cream-divider mx-1" />
+              <button
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => toggleCustomTag('code')}
+                className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors text-[11px] font-mono ${
+                  activeFormats.code
+                    ? 'bg-warm-accent text-[#FAF8F5]'
+                    : 'text-warm-muted hover:text-warm-text active:bg-cream-divider'
+                }`}
+              >
+                &lt;/&gt;
+              </button>
+              <button
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => toggleCustomTag('tg-spoiler')}
+                className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors ${
+                  activeFormats.spoiler
+                    ? 'bg-warm-accent text-[#FAF8F5]'
+                    : 'text-warm-muted hover:text-warm-text active:bg-cream-divider'
+                }`}
+              >
+                <span className="material-symbols-outlined text-[17px] leading-none">
+                  visibility_off
+                </span>
+              </button>
+              <div className="w-[1px] h-4 bg-cream-divider mx-1" />
+              <button
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={handleClearFormatting}
+                className="flex items-center justify-center w-8 h-8 rounded-full transition-colors text-warm-muted hover:text-warm-text active:bg-cream-divider"
+              >
+                <span className="material-symbols-outlined text-[16px] leading-none">
+                  format_clear
+                </span>
+              </button>
+            </div>
+          </div>,
+          document.body
+        )}
+      {botPromptModal.isOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-[#24201D]/40 animate-page-fade">
+          <div className="w-full max-w-sm p-5 rounded-2xl bg-[#FAF8F5] border border-cream-divider shadow-sm flex flex-col gap-3.5">
+            <div className="flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-full bg-warm-accent-light text-warm-accent flex items-center justify-center shrink-0">
+                <span className="material-symbols-outlined text-[18px]">mark_chat_unread</span>
+              </div>
+              <h3 className="text-sm font-semibold text-warm-text">
+                {t('bot_modal_title')}
+              </h3>
+            </div>
+            <p className="text-xs leading-relaxed text-warm-muted">
+              {t('bot_modal_desc')}
+            </p>
+            <div className="flex items-center justify-end gap-2 pt-1.5">
+              <button
+                onClick={() => setBotPromptModal({ isOpen: false, botUsername: '' })}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium text-warm-muted bg-cream-surface physics-bounce"
+              >
+                {t('bot_modal_later')}
+              </button>
+              <button
+                onClick={() => {
+                  const botLink = botPromptModal.botUsername
+                    ? `https://t.me/${botPromptModal.botUsername}?start=export`
+                    : 'https://t.me';
+                  if (window.Telegram?.WebApp?.openTelegramLink) {
+                    window.Telegram.WebApp.openTelegramLink(botLink);
+                  } else {
+                    window.open(botLink, '_blank');
+                  }
+                  setBotPromptModal({ isOpen: false, botUsername: '' });
+                }}
+                className="px-3.5 py-1.5 rounded-lg text-xs font-semibold text-white bg-warm-accent flex items-center gap-1.5 physics-bounce"
+              >
+                <span>{t('bot_modal_open')}</span>
+                <span className="material-symbols-outlined text-[13px]">open_in_new</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
