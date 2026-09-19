@@ -1,16 +1,68 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { NoteItem, ContentBlock, TaskItem, TableCell, TopicItem } from '../types';
+import { NoteItem, ContentBlock, TaskItem, TableCell, TopicItem, MediaImageItem, ChannelItem } from '../types';
 import { t } from '../services/i18n';
-import { exportNoteToTelegram } from '../services/api';
+import { exportNoteToTelegram, uploadToCatbox } from '../services/api';
+import { uploadToImgbb, deleteFromImgbb } from '../services/imgbb';
 
 interface EditorViewProps {
   note: NoteItem;
   topics: TopicItem[];
+  channels?: ChannelItem[];
   onBack: () => void;
   onSave: (updated: NoteItem) => void;
   onDelete: (id: string) => void;
 }
+
+const setCaretToStart = (el: HTMLElement) => {
+  el.focus();
+  const sel = window.getSelection();
+  if (!sel) return;
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+};
+
+const setCaretAtTextOffset = (root: Node, targetOffset: number) => {
+  const sel = window.getSelection();
+  if (!sel) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  let currentLength = 0;
+  let node = walker.nextNode();
+  while (node) {
+    const nextLength = currentLength + (node.nodeValue?.length || 0);
+    if (targetOffset <= nextLength) {
+      const range = document.createRange();
+      range.setStart(node, Math.max(0, targetOffset - currentLength));
+      range.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return;
+    }
+    currentLength = nextLength;
+    node = walker.nextNode();
+  }
+  const range = document.createRange();
+  range.selectNodeContents(root);
+  range.collapse(false);
+  sel.removeAllRanges();
+  sel.addRange(range);
+};
+
+const stripEdgeBreaks = (html: string): string => {
+  let result = (html || '').trim();
+  let prev = '';
+  while (result !== prev) {
+    prev = result;
+    result = result
+      .replace(/^(?:&nbsp;|\s|<br\s*[\/]?>|<div>(?:\s|<br\s*[\/]?>|&nbsp;)*<\/div>|\u200B)+/gi, '')
+      .replace(/(?:&nbsp;|\s|<br\s*[\/]?>|<div>(?:\s|<br\s*[\/]?>|&nbsp;)*<\/div>|\u200B)+$/gi, '')
+      .trim();
+  }
+  return result;
+};
 
 const EditableBlock: React.FC<{
   html: string;
@@ -18,14 +70,24 @@ const EditableBlock: React.FC<{
   className?: string;
   onFocus?: () => void;
   onChange: (newHtml: string) => void;
-}> = ({ html, placeholder, className, onFocus, onChange }) => {
+  onKeyDown?: (e: React.KeyboardEvent<HTMLDivElement>) => void;
+}> = ({ html, placeholder, className, onFocus, onChange, onKeyDown }) => {
   const divRef = useRef<HTMLDivElement>(null);
+  const lastHtmlRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (divRef.current && divRef.current.innerHTML !== html) {
+    if (!divRef.current) return;
+    if (lastHtmlRef.current === null || html !== lastHtmlRef.current) {
       divRef.current.innerHTML = html || '';
+      lastHtmlRef.current = html;
     }
   }, [html]);
+
+  const handlePaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const text = e.clipboardData.getData('text/plain');
+    document.execCommand('insertText', false, text);
+  };
 
   return (
     <div
@@ -35,8 +97,17 @@ const EditableBlock: React.FC<{
       data-placeholder={placeholder}
       onFocus={onFocus}
       onInput={(e) => {
-        onChange(e.currentTarget.innerHTML);
+        const currentHtml = e.currentTarget.innerHTML;
+        lastHtmlRef.current = currentHtml;
+        onChange(currentHtml);
       }}
+      onBlur={(e) => {
+        const currentHtml = e.currentTarget.innerHTML;
+        lastHtmlRef.current = currentHtml;
+        onChange(currentHtml);
+      }}
+      onKeyDown={onKeyDown}
+      onPaste={handlePaste}
       className={className}
     />
   );
@@ -45,6 +116,7 @@ const EditableBlock: React.FC<{
 export const EditorView: React.FC<EditorViewProps> = ({
   note,
   topics,
+  channels = [],
   onBack,
   onSave,
   onDelete,
@@ -53,8 +125,53 @@ export const EditorView: React.FC<EditorViewProps> = ({
     if (!rawBlocks || rawBlocks.length === 0) {
       return [{ id: `p-${Date.now()}`, type: 'paragraph', text: '' }];
     }
-    return rawBlocks.map((b, idx) => {
+    return rawBlocks.map((b: any, idx) => {
       const id = b.id || `block-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`;
+      if (b.type === 'media') {
+        const rawImages = Array.isArray(b.images) ? b.images : [];
+        const normalizedImages: MediaImageItem[] = rawImages
+          .map((img: any, imgIdx: number) => {
+            if (typeof img === 'string') {
+              return { id: `img-${Date.now()}-${imgIdx}`, url: img };
+            }
+            return {
+              id: img?.id || `img-${Date.now()}-${imgIdx}`,
+              url: img?.url || '',
+              delete_url: img?.delete_url,
+            };
+          })
+          .filter((img: MediaImageItem) => Boolean(img.url));
+        return {
+          id,
+          type: 'media',
+          layout: b.layout || (normalizedImages.length > 1 ? 'collage' : 'single'),
+          images: normalizedImages,
+          caption: b.caption || '',
+        };
+      }
+      if (b.type === 'blockquote') {
+        const text = b.blocks && b.blocks[0] && b.blocks[0].text ? b.blocks[0].text : (b.text || '');
+        return { id, type: 'quote', text, credit: b.credit || '' };
+      }
+      if (b.type === 'pre') {
+        return { id, type: 'code', text: b.text || '', language: b.language || 'javascript' };
+      }
+      if (b.type === 'button_row') {
+        return {
+          id,
+          type: 'button_row',
+          align: b.align || 'center',
+          buttons: Array.isArray(b.buttons)
+            ? b.buttons.map((btn: any, bIdx: number) => ({
+                id: btn.id || `btn-${Date.now()}-${bIdx}`,
+                text: btn.text || 'Button',
+                style: btn.style || 'default',
+                type: btn.type || 'url',
+                value: btn.value || btn.url || btn.copy_text || '',
+              }))
+            : [],
+        };
+      }
       if (b.type === 'list') {
         const hasTaskStyle = b.style === 'task' || (!b.style && b.items?.some((i: any) => i.has_checkbox || i.is_checked !== undefined));
         const resolvedStyle = hasTaskStyle ? 'task' : (b.style || 'bullet');
@@ -62,7 +179,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
           ...b,
           id,
           style: resolvedStyle,
-          items: (b.items || []).map((it) => ({
+          items: (b.items || []).map((it: any) => ({
             id: it.id || `task-${Date.now()}-${Math.random()}`,
             text: it.text || '',
             is_checked: Boolean(it.is_checked),
@@ -79,7 +196,249 @@ export const EditorView: React.FC<EditorViewProps> = ({
   const [historyIndex, setHistoryIndex] = useState<number>(0);
   const [focusedBlockIndex, setFocusedBlockIndex] = useState<number | null>(null);
   const [activeTableCell, setActiveTableCell] = useState<{ blockIndex: number; rowIndex: number; colIndex: number } | null>(null);
-  const [activeToolbarTab, setActiveToolbarTab] = useState<'text' | 'lists' | 'quotes' | 'table' | 'objects'>('text');
+  const [activeToolbarTab, setActiveToolbarTab] = useState<'text' | 'lists' | 'quotes' | 'media' | 'table' | 'objects'>('text');
+  const [activeSlideIndices, setActiveSlideIndices] = useState<Record<string, number>>({});
+  const [openDetailsMap, setOpenDetailsMap] = useState<Record<string, boolean>>({});
+  const [isUploadingGlobal, setIsUploadingGlobal] = useState<boolean>(false);
+  const [editingButtonModal, setEditingButtonModal] = useState<{
+    blockIndex: number;
+    buttonIndex: number;
+    id: string;
+    text: string;
+    style: 'default' | 'primary' | 'success' | 'danger';
+    type: 'url' | 'copy_text';
+    value: string;
+  } | null>(null);
+
+  const [timePickerModal, setTimePickerModal] = useState<{
+    isOpen: boolean;
+    datetimeVal: string;
+    format: 'wDT' | 'full' | 'time' | 'rel';
+  }>({
+    isOpen: false,
+    datetimeVal: '',
+    format: 'wDT',
+  });
+
+  const savedRangeRef = useRef<Range | null>(null);
+
+  const openTimePicker = () => {
+    triggerHaptic('light');
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0) {
+      savedRangeRef.current = sel.getRangeAt(0).cloneRange();
+    }
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    setTimePickerModal({
+      isOpen: true,
+      datetimeVal: `${year}-${month}-${day}T${hours}:${minutes}`,
+      format: 'wDT',
+    });
+  };
+
+  const insertDynamicTime = () => {
+    if (!timePickerModal.datetimeVal) return;
+    triggerHaptic('medium');
+    const dateObj = new Date(timePickerModal.datetimeVal);
+    const unixTimestamp = Math.floor(dateObj.getTime() / 1000);
+    const formatCode = timePickerModal.format === 'full' ? '' : timePickerModal.format;
+    const formatAttr = formatCode ? ` format="${formatCode}"` : '';
+    const localizedDisplay = dateObj.toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+    const timeTagHtml = `<tg-time unix="${unixTimestamp}"${formatAttr}>${localizedDisplay}</tg-time>&nbsp;`;
+
+    if (savedRangeRef.current) {
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(savedRangeRef.current);
+      document.execCommand('insertHTML', false, timeTagHtml);
+      if (focusedBlockIndex !== null && currentNote.blocks[focusedBlockIndex]) {
+        const currentEl = blockElementRefs.current[currentNote.blocks[focusedBlockIndex].id];
+        const editableDiv = currentEl?.querySelector('[contenteditable]');
+        if (editableDiv) {
+          updateBlock(
+            focusedBlockIndex,
+            { ...currentNote.blocks[focusedBlockIndex], text: editableDiv.innerHTML } as ContentBlock,
+            true
+          );
+        }
+      }
+    } else {
+      const targetPos = focusedBlockIndex !== null && focusedBlockIndex >= 0 && focusedBlockIndex < currentNote.blocks.length
+        ? focusedBlockIndex + 1
+        : currentNote.blocks.length;
+      const newBlock: ContentBlock = {
+        id: `p-${Date.now()}`,
+        type: 'paragraph',
+        text: timeTagHtml,
+      };
+      const nextBlocks = [
+        ...currentNote.blocks.slice(0, targetPos),
+        newBlock,
+        ...currentNote.blocks.slice(targetPos),
+      ];
+      persistChange({ ...currentNote, blocks: nextBlocks }, true);
+      setFocusedBlockIndex(targetPos);
+    }
+    setTimePickerModal((prev) => ({ ...prev, isOpen: false }));
+    savedRangeRef.current = null;
+  };
+
+  const toggleDetails = (blockId: string) => {
+    triggerHaptic('light');
+    setOpenDetailsMap((prev) => ({
+      ...prev,
+      [blockId]: prev[blockId] === false ? true : false,
+    }));
+  };
+const [uploadingBlockId, setUploadingBlockId] = useState<string | null>(null);
+const [uploadingMediaType, setUploadingMediaType] = useState<'image' | 'audio' | 'file' | null>(null);
+const fileInputRef = useRef<HTMLInputElement>(null);
+const audioInputRef = useRef<HTMLInputElement>(null);
+const docFileInputRef = useRef<HTMLInputElement>(null);
+const targetMediaBlockIndexRef = useRef<number | null>(null);
+const totalImageCount = currentNote.blocks.reduce((count, b) => {
+  return b.type === 'media' ? count + (b.images?.length || 0) : count;
+}, 0);
+const totalAudioCount = currentNote.blocks.filter((b) => b.type === 'audio').length;
+const totalFileCount = currentNote.blocks.filter((b) => b.type === 'file').length;
+
+const formatFileSize = (bytes?: number): string => {
+  if (!bytes) return '';
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+const triggerUploadAudio = () => {
+  if (totalAudioCount >= 1) {
+    triggerHaptic('medium');
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('warning');
+    alert(t('audio_limit_reached'));
+    return;
+  }
+  triggerHaptic('light');
+  audioInputRef.current?.click();
+};
+
+const triggerUploadDoc = () => {
+  if (totalFileCount >= 1) {
+    triggerHaptic('medium');
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('warning');
+    alert(t('file_limit_reached'));
+    return;
+  }
+  triggerHaptic('light');
+  docFileInputRef.current?.click();
+};
+
+const handleAudioFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  e.target.value = '';
+  if (file.size > 10 * 1024 * 1024) {
+    triggerHaptic('heavy');
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
+    alert(t('file_size_exceeded'));
+    return;
+  }
+  setIsUploadingGlobal(true);
+  setUploadingMediaType('audio');
+  try {
+    const result = await uploadToCatbox(file);
+    const newBlock: ContentBlock = {
+      id: `b-audio-${Date.now()}`,
+      type: 'audio',
+      url: result.url,
+      name: file.name,
+      size: file.size,
+      caption: '',
+    };
+    const trailingParagraph: ContentBlock = {
+      id: `p-${Date.now()}`,
+      type: 'paragraph',
+      text: '',
+    };
+    const targetPos = focusedBlockIndex !== null && focusedBlockIndex >= 0 && focusedBlockIndex < currentNote.blocks.length
+      ? focusedBlockIndex + 1
+      : currentNote.blocks.length;
+    const nextBlocks = [
+      ...currentNote.blocks.slice(0, targetPos),
+      newBlock,
+      trailingParagraph,
+      ...currentNote.blocks.slice(targetPos),
+    ];
+    persistChange({ ...currentNote, blocks: nextBlocks }, true);
+    setFocusedBlockIndex(targetPos);
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('success');
+  } catch (err) {
+    console.error(`AUDIO_UPLOAD_FAILED: ${(err as Error).message}`);
+    triggerHaptic('heavy');
+    setExportNotice(t('export_failed'));
+    setTimeout(() => setExportNotice(null), 3000);
+  } finally {
+    setIsUploadingGlobal(false);
+    setUploadingMediaType(null);
+  }
+};
+
+const handleDocFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  e.target.value = '';
+  if (file.size > 10 * 1024 * 1024) {
+    triggerHaptic('heavy');
+    alert(t('file_size_exceeded'));
+    return;
+  }
+  setIsUploadingGlobal(true);
+  setUploadingMediaType('file');
+  try {
+    const result = await uploadToCatbox(file);
+    const newBlock: ContentBlock = {
+      id: `b-doc-${Date.now()}`,
+      type: 'file',
+      url: result.url,
+      name: file.name,
+      size: file.size,
+      caption: '',
+    };
+    const trailingParagraph: ContentBlock = {
+      id: `p-${Date.now()}`,
+      type: 'paragraph',
+      text: '',
+    };
+    const targetPos = focusedBlockIndex !== null && focusedBlockIndex >= 0 && focusedBlockIndex < currentNote.blocks.length
+      ? focusedBlockIndex + 1
+      : currentNote.blocks.length;
+    const nextBlocks = [
+      ...currentNote.blocks.slice(0, targetPos),
+      newBlock,
+      trailingParagraph,
+      ...currentNote.blocks.slice(targetPos),
+    ];
+    persistChange({ ...currentNote, blocks: nextBlocks }, true);
+    setFocusedBlockIndex(targetPos);
+    triggerHaptic('medium');
+  } catch (err) {
+    console.error(`DOC_UPLOAD_FAILED: ${(err as Error).message}`);
+    triggerHaptic('heavy');
+    setExportNotice(t('export_failed'));
+    setTimeout(() => setExportNotice(null), 3000);
+  } finally {
+    setIsUploadingGlobal(false);
+    setUploadingMediaType(null);
+  }
+};
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [showToc, setShowToc] = useState<boolean>(false);
@@ -108,6 +467,8 @@ export const EditorView: React.FC<EditorViewProps> = ({
   const blockElementRefs = useRef<Record<string, HTMLElement | null>>({});
   const historyTimerRef = useRef<number | null>(null);
   const flipPositionsRef = useRef<Map<string, number>>(new Map());
+  const lastEnterRef = useRef<{ index: number; time: number } | null>(null);
+  const pendingDeletionsRef = useRef<Set<string>>(new Set());
 
   useLayoutEffect(() => {
     if (flipPositionsRef.current.size === 0) return;
@@ -139,7 +500,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
     });
   }, [currentNote.blocks]);
 
-  const triggerHaptic = (style: 'light' | 'medium' = 'light') => {
+  const triggerHaptic = (style: 'light' | 'medium' | 'heavy' | 'rigid' | 'soft' = 'light') => {
     window.Telegram?.WebApp?.HapticFeedback?.impactOccurred(style);
   };
 
@@ -173,7 +534,114 @@ export const EditorView: React.FC<EditorViewProps> = ({
 
   const isMovingRef = useRef<boolean>(false);
 
-  
+  const triggerUploadNewImage = () => {
+  if (totalImageCount >= 2) {
+    triggerHaptic('medium');
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('warning');
+    return;
+  }
+  triggerHaptic('light');
+  targetMediaBlockIndexRef.current = null;
+  fileInputRef.current?.click();
+};
+
+const triggerAddSecondImage = (blockIndex: number) => {
+  if (totalImageCount >= 2) {
+    triggerHaptic('medium');
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('warning');
+    return;
+  }
+  triggerHaptic('light');
+  targetMediaBlockIndexRef.current = blockIndex;
+  fileInputRef.current?.click();
+};
+
+const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  e.target.value = '';
+
+  const targetIdx = targetMediaBlockIndexRef.current;
+  const tempImgId = `img-${Date.now()}`;
+  setIsUploadingGlobal(true);
+
+  if (targetIdx !== null && currentNote.blocks[targetIdx]?.type === 'media') {
+    setUploadingBlockId(currentNote.blocks[targetIdx].id);
+  }
+
+  try {
+    const result = await uploadToImgbb(file);
+    const newImgItem: MediaImageItem = {
+      id: tempImgId,
+      url: result.url,
+      delete_url: result.delete_url,
+    };
+
+    if (targetIdx !== null && currentNote.blocks[targetIdx]?.type === 'media') {
+      const existingBlock = currentNote.blocks[targetIdx] as Extract<ContentBlock, { type: 'media' }>;
+      const nextImages = [...existingBlock.images, newImgItem].slice(0, 2);
+      const nextBlock: ContentBlock = {
+        ...existingBlock,
+        layout: 'collage',
+        images: nextImages,
+      };
+      updateBlock(targetIdx, nextBlock, true);
+    } else {
+      const newBlockId = `b-media-${Date.now()}`;
+      const newBlock: ContentBlock = {
+        id: newBlockId,
+        type: 'media',
+        layout: 'single',
+        caption: '',
+        images: [newImgItem],
+      };
+      const trailingParagraph: ContentBlock = {
+        id: `p-${Date.now()}`,
+        type: 'paragraph',
+        text: '',
+      };
+
+      const targetPos = focusedBlockIndex !== null && focusedBlockIndex >= 0 && focusedBlockIndex < currentNote.blocks.length
+        ? focusedBlockIndex + 1
+        : currentNote.blocks.length;
+
+      const nextBlocks = [
+        ...currentNote.blocks.slice(0, targetPos),
+        newBlock,
+        trailingParagraph,
+        ...currentNote.blocks.slice(targetPos),
+      ];
+
+      persistChange({ ...currentNote, blocks: nextBlocks }, true);
+      setFocusedBlockIndex(targetPos);
+    }
+
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('success');
+  } catch (err) {
+    console.error(`IMAGE_UPLOAD_FAILED: ${(err as Error).message}`);
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
+  } finally {
+    setIsUploadingGlobal(false);
+    setUploadingBlockId(null);
+    targetMediaBlockIndexRef.current = null;
+  }
+};
+
+const toggleMediaLayout = (blockIndex: number, newLayout: 'collage' | 'slideshow') => {
+  triggerHaptic('light');
+  const block = currentNote.blocks[blockIndex];
+  if (block.type !== 'media') return;
+  updateBlock(blockIndex, { ...block, layout: newLayout }, true);
+};
+
+const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: number) => {
+  triggerHaptic('light');
+  setActiveSlideIndices((prev) => {
+    const current = prev[blockId] || 0;
+    const nextIndex = direction === 'next' ? (current + 1) % total : (current - 1 + total) % total;
+    return { ...prev, [blockId]: nextIndex };
+  });
+};
 
   const updateActiveFormats = useCallback(() => {
     const sel = window.getSelection();
@@ -213,17 +681,23 @@ export const EditorView: React.FC<EditorViewProps> = ({
 
     const handleFocusIn = (e: FocusEvent) => {
       const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-modal="true"]')) {
+        setIsEditorActive(false);
+        return;
+      }
       if (target?.closest('[contenteditable="true"]') || target?.tagName === 'TEXTAREA' || target?.tagName === 'INPUT') {
         setIsEditorActive(true);
       }
     };
-
     const handleFocusOut = (e: FocusEvent) => {
       const related = e.relatedTarget as HTMLElement | null;
       if (!related?.closest('[data-format-bar="true"]')) {
         setTimeout(() => {
           const active = document.activeElement as HTMLElement | null;
-          if (!active?.closest('[contenteditable="true"]') && active?.tagName !== 'TEXTAREA' && active?.tagName !== 'INPUT') {
+          if (
+            (!active?.closest('[contenteditable="true"]') && active?.tagName !== 'TEXTAREA' && active?.tagName !== 'INPUT') ||
+            active?.closest('[data-modal="true"]')
+          ) {
             setIsEditorActive(false);
           }
         }, 120);
@@ -354,13 +828,24 @@ export const EditorView: React.FC<EditorViewProps> = ({
     updateActiveFormats();
   };
 
+  const onBackRef = useRef(onBack);
+  onBackRef.current = onBack;
+
+  const handleSafeBack = useCallback(() => {
+    pendingDeletionsRef.current.forEach((url) => {
+      deleteFromImgbb(url);
+    });
+    pendingDeletionsRef.current.clear();
+    onBackRef.current();
+  }, []);
+
   useEffect(() => {
     const tg = window.Telegram?.WebApp;
     if (tg?.BackButton) {
       tg.BackButton.show();
       const handleNativeBack = () => {
         triggerHaptic();
-        onBack();
+        handleSafeBack();
       };
       tg.BackButton.onClick(handleNativeBack);
       return () => {
@@ -368,7 +853,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
         tg.BackButton.hide();
       };
     }
-  }, [onBack]);
+  }, [handleSafeBack]);
 
   const autoResize = (el: HTMLTextAreaElement) => {
     el.style.height = 'auto';
@@ -414,6 +899,55 @@ export const EditorView: React.FC<EditorViewProps> = ({
       setHistoryIndex(targetIndex);
       setCurrentNote(target);
       onSave(target);
+
+      target.blocks.forEach((b) => {
+        if (b.type === 'media' && Array.isArray(b.images)) {
+          b.images.forEach((img) => {
+            if (img.delete_url && pendingDeletionsRef.current.has(img.delete_url)) {
+              pendingDeletionsRef.current.delete(img.delete_url);
+            }
+          });
+        }
+      });
+    }
+  };
+
+  const removeBlock = (index: number) => {
+    triggerHaptic('medium');
+    const block = currentNote.blocks[index];
+    if (block && block.type === 'media' && Array.isArray(block.images)) {
+      block.images.forEach((img) => {
+        if (img.delete_url) {
+          pendingDeletionsRef.current.add(img.delete_url);
+        }
+      });
+    }
+    const filtered = currentNote.blocks.filter((_, i) => i !== index);
+    persistChange({ ...currentNote, blocks: filtered }, true);
+    setFocusedBlockIndex(null);
+  };
+
+  const removeImageFromBlock = (blockIndex: number, imageIndex: number) => {
+    triggerHaptic('light');
+    const block = currentNote.blocks[blockIndex];
+    if (block.type !== 'media') return;
+    const targetImg = block.images[imageIndex];
+    if (targetImg?.delete_url) {
+      pendingDeletionsRef.current.add(targetImg.delete_url);
+    }
+    const nextImages = block.images.filter((_, i) => i !== imageIndex);
+    if (nextImages.length === 0) {
+      removeBlock(blockIndex);
+    } else {
+      updateBlock(
+        blockIndex,
+        {
+          ...block,
+          layout: 'single',
+          images: nextImages,
+        },
+        true
+      );
     }
   };
 
@@ -428,6 +962,171 @@ export const EditorView: React.FC<EditorViewProps> = ({
     }
   };
 
+  const handleParagraphSplit = (index: number, leftHtml: string, rightHtml: string) => {
+    triggerHaptic('light');
+    const currentBlock = currentNote.blocks[index];
+    if (!currentBlock || currentBlock.type !== 'paragraph') return;
+    const newBlockId = `p-${Date.now()}`;
+    const updatedCurrent: ContentBlock = {
+      id: currentBlock.id,
+      type: 'paragraph',
+      text: leftHtml,
+    };
+    const newBlock: ContentBlock = {
+      id: newBlockId,
+      type: 'paragraph',
+      text: rightHtml,
+    };
+    const nextBlocks = [
+      ...currentNote.blocks.slice(0, index),
+      updatedCurrent,
+      newBlock,
+      ...currentNote.blocks.slice(index + 1),
+    ];
+    persistChange({ ...currentNote, blocks: nextBlocks }, true);
+    setFocusedBlockIndex(index + 1);
+    setTimeout(() => {
+      const el = blockElementRefs.current[newBlockId];
+      const editable = el?.querySelector<HTMLDivElement>('[contenteditable="true"]');
+      if (editable) {
+        setCaretToStart(editable);
+      }
+    }, 30);
+  };
+
+  const handleParagraphMerge = (index: number, currentHtml: string) => {
+    if (index <= 0) return;
+    const prevBlock = currentNote.blocks[index - 1];
+    if (!prevBlock) return;
+
+    if (prevBlock.type === 'paragraph') {
+      triggerHaptic('light');
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = prevBlock.text;
+      const junctionOffset = tempDiv.textContent?.length || 0;
+
+      const cleanCurrent = stripEdgeBreaks(currentHtml);
+      const mergedText = prevBlock.text + cleanCurrent;
+
+      const updatedPrev: ContentBlock = {
+        id: prevBlock.id,
+        type: 'paragraph',
+        text: mergedText,
+      };
+
+      const nextBlocks = [
+        ...currentNote.blocks.slice(0, index - 1),
+        updatedPrev,
+        ...currentNote.blocks.slice(index + 1),
+      ];
+
+      persistChange({ ...currentNote, blocks: nextBlocks }, true);
+      setFocusedBlockIndex(index - 1);
+
+      setTimeout(() => {
+        const prevEl = blockElementRefs.current[prevBlock.id];
+        const prevEditable = prevEl?.querySelector<HTMLDivElement>('[contenteditable="true"]');
+        if (prevEditable) {
+          prevEditable.focus();
+          setCaretAtTextOffset(prevEditable, junctionOffset);
+        }
+      }, 40);
+    } else if (!currentHtml || currentHtml.replace(/<[^>]*>/g, '').trim() === '') {
+      triggerHaptic('light');
+      const nextBlocks = currentNote.blocks.filter((_, i) => i !== index);
+      persistChange({ ...currentNote, blocks: nextBlocks }, true);
+      setFocusedBlockIndex(index - 1);
+
+      setTimeout(() => {
+        const prevEl = blockElementRefs.current[prevBlock.id];
+        const targetFocus = prevEl?.querySelector<HTMLElement>('[contenteditable="true"], input, textarea');
+        if (targetFocus) {
+          targetFocus.focus();
+        }
+      }, 40);
+    }
+  };
+
+  const handleParagraphKeyDown = (e: React.KeyboardEvent<HTMLDivElement>, index: number) => {
+    if (e.key !== 'Enter') {
+      lastEnterRef.current = null;
+    }
+
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return;
+      const range = sel.getRangeAt(0);
+      const el = e.currentTarget;
+
+      const preRange = range.cloneRange();
+      preRange.selectNodeContents(el);
+      preRange.setEnd(range.startContainer, range.startOffset);
+      const tempLeft = document.createElement('div');
+      tempLeft.appendChild(preRange.cloneContents());
+
+      const postRange = range.cloneRange();
+      postRange.selectNodeContents(el);
+      postRange.setStart(range.endContainer, range.endOffset);
+      const tempRight = document.createElement('div');
+      tempRight.appendChild(postRange.cloneContents());
+
+      const leftHtml = tempLeft.innerHTML;
+      const rightHtml = tempRight.innerHTML;
+      const isConsecutive = lastEnterRef.current?.index === index;
+      const leftEndsWithBr = /(?:<br\s*[\/]?>|<div>(?:\s|<br\s*[\/]?>)*<\/div>|\s)+$/i.test(leftHtml);
+
+      if (isConsecutive || leftEndsWithBr) {
+        lastEnterRef.current = null;
+        const cleanLeft = stripEdgeBreaks(leftHtml);
+        const cleanRight = stripEdgeBreaks(rightHtml);
+        handleParagraphSplit(index, cleanLeft, cleanRight);
+        return;
+      }
+
+      lastEnterRef.current = { index, time: Date.now() };
+      document.execCommand('insertLineBreak');
+      updateBlock(
+        index,
+        {
+          id: currentNote.blocks[index].id,
+          type: 'paragraph',
+          text: el.innerHTML,
+        },
+        false
+      );
+      return;
+    }
+
+    if (e.key === 'Backspace') {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return;
+      const range = sel.getRangeAt(0);
+      const el = e.currentTarget;
+
+      const cleanText = (el.textContent || '').replace(/[\u200B\uFEFF\s]/g, '');
+      const isBlockEmpty = cleanText.length === 0;
+
+      let isAtCaretStart = false;
+      if (!isBlockEmpty) {
+        try {
+          const preRange = document.createRange();
+          preRange.selectNodeContents(el);
+          preRange.setEnd(range.startContainer, range.startOffset);
+          const textBefore = (preRange.toString() || '').replace(/[\u200B\uFEFF\r\n]/g, '');
+          isAtCaretStart = textBefore.length === 0;
+        } catch {
+          isAtCaretStart = range.startOffset === 0;
+        }
+      }
+
+      if (isBlockEmpty || isAtCaretStart) {
+        e.preventDefault();
+        handleParagraphMerge(index, isBlockEmpty ? '' : el.innerHTML);
+      }
+    }
+  };
+
   const handleTitleChange = (title: string) => {
     persistChange({ ...currentNote, title }, false);
   };
@@ -438,12 +1137,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
     persistChange({ ...currentNote, blocks: nextBlocks }, immediateHistory);
   };
 
-  const removeBlock = (index: number) => {
-    triggerHaptic('medium');
-    const filtered = currentNote.blocks.filter((_, i) => i !== index);
-    persistChange({ ...currentNote, blocks: filtered }, true);
-    setFocusedBlockIndex(null);
-  };
+
 
   const moveBlock = (index: number, direction: 'up' | 'down') => {
     const targetIndex = direction === 'up' ? index - 1 : index + 1;
@@ -482,11 +1176,14 @@ export const EditorView: React.FC<EditorViewProps> = ({
     type: ContentBlock['type'],
     opts?: { size?: 1 | 2 | 3 | 4 | 5 | 6; style?: 'task' | 'bullet' | 'ordered' }
   ) => {
+    if (type === 'media') {
+      triggerUploadNewImage();
+      return;
+    }
     triggerHaptic('medium');
     const bId1 = `b-${Date.now()}-1`;
     const bId2 = `b-${Date.now()}-2`;
     let primaryBlock: ContentBlock;
-
     switch (type) {
       case 'heading':
         primaryBlock = { id: bId1, type: 'heading', size: opts?.size || 2, text: '' };
@@ -541,28 +1238,45 @@ export const EditorView: React.FC<EditorViewProps> = ({
       case 'divider':
         primaryBlock = { id: bId1, type: 'divider' };
         break;
+      case 'button_row':
+        primaryBlock = {
+          id: bId1,
+          type: 'button_row',
+          align: 'center',
+          buttons: [
+            {
+              id: `btn-${Date.now()}`,
+              text: t('btn_default_label'),
+              style: 'primary',
+              type: 'url',
+              value: 'https://t.me',
+            },
+          ],
+        };
+        break;
+      case 'footer':
+        primaryBlock = { id: bId1, type: 'footer', text: '' };
+        break;
+      default:
+        primaryBlock = { id: bId1, type: 'paragraph', text: '' };
+        break;
     }
-
     const trailingParagraph: ContentBlock = {
       id: bId2,
       type: 'paragraph',
       text: '',
     };
-
     const targetIndex = focusedBlockIndex !== null && focusedBlockIndex >= 0 && focusedBlockIndex < currentNote.blocks.length
       ? focusedBlockIndex + 1
       : currentNote.blocks.length;
-
     const insertedBlocks = type === 'paragraph' ? [primaryBlock] : [primaryBlock, trailingParagraph];
     const nextBlocks = [
       ...currentNote.blocks.slice(0, targetIndex),
       ...insertedBlocks,
       ...currentNote.blocks.slice(targetIndex),
     ];
-
     persistChange({ ...currentNote, blocks: nextBlocks }, true);
     setFocusedBlockIndex(targetIndex);
-
     setTimeout(() => {
       blockElementRefs.current[bId1]?.scrollIntoView({
         behavior: 'smooth',
@@ -645,6 +1359,174 @@ export const EditorView: React.FC<EditorViewProps> = ({
     updateBlock(tableIndex, { ...tableBlock, is_striped: !tableBlock.is_striped }, true);
   };
 
+  const toggleTableCompact = (tableIndex: number) => {
+    triggerHaptic('light');
+    const tableBlock = currentNote.blocks[tableIndex];
+    if (tableBlock.type !== 'table') return;
+    updateBlock(tableIndex, { ...tableBlock, is_compact: !tableBlock.is_compact }, true);
+  };
+
+  const [activeDraggingBtnId, setActiveDraggingBtnId] = useState<string | null>(null);
+  const [activeJiggleRowIndex, setActiveJiggleRowIndex] = useState<number | null>(null);
+  const [dragOffsetX, setDragOffsetX] = useState<number>(0);
+
+  const buttonDragRef = useRef<{
+    blockIndex: number;
+    btnIndex: number;
+    startX: number;
+    startY: number;
+    isDragging: boolean;
+    timer: number | null;
+  } | null>(null);
+
+  const handleBtnTouchStart = (blockIndex: number, btnIndex: number, btnId: string, e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    const timer = window.setTimeout(() => {
+      triggerHaptic('rigid');
+      setActiveDraggingBtnId(btnId);
+      setActiveJiggleRowIndex(blockIndex);
+      if (buttonDragRef.current) {
+        buttonDragRef.current.isDragging = true;
+      }
+    }, 320);
+
+    buttonDragRef.current = {
+      blockIndex,
+      btnIndex,
+      startX: touch.clientX,
+      startY: touch.clientY,
+      isDragging: false,
+      timer,
+    };
+  };
+
+  const handleBtnTouchMove = (blockIndex: number, e: React.TouchEvent) => {
+    if (!buttonDragRef.current) return;
+    const touch = e.touches[0];
+    const diffY = Math.abs(touch.clientY - buttonDragRef.current.startY);
+    const diffX = touch.clientX - buttonDragRef.current.startX;
+
+    if (!buttonDragRef.current.isDragging && diffY > 10) {
+      if (buttonDragRef.current.timer) {
+        clearTimeout(buttonDragRef.current.timer);
+        buttonDragRef.current.timer = null;
+      }
+      return;
+    }
+
+    if (buttonDragRef.current.isDragging) {
+      e.preventDefault();
+      setDragOffsetX(diffX);
+      const currentIdx = buttonDragRef.current.btnIndex;
+      const block = currentNote.blocks[blockIndex];
+      if (block?.type !== 'button_row') return;
+
+      if (diffX > 60 && currentIdx < block.buttons.length - 1) {
+        triggerHaptic('medium');
+        const nextButtons = [...block.buttons];
+        const temp = nextButtons[currentIdx];
+        nextButtons[currentIdx] = nextButtons[currentIdx + 1];
+        nextButtons[currentIdx + 1] = temp;
+        updateBlock(blockIndex, { ...block, buttons: nextButtons }, true);
+        buttonDragRef.current.btnIndex = currentIdx + 1;
+        buttonDragRef.current.startX = touch.clientX;
+        setDragOffsetX(0);
+      } else if (diffX < -60 && currentIdx > 0) {
+        triggerHaptic('medium');
+        const nextButtons = [...block.buttons];
+        const temp = nextButtons[currentIdx];
+        nextButtons[currentIdx] = nextButtons[currentIdx - 1];
+        nextButtons[currentIdx - 1] = temp;
+        updateBlock(blockIndex, { ...block, buttons: nextButtons }, true);
+        buttonDragRef.current.btnIndex = currentIdx - 1;
+        buttonDragRef.current.startX = touch.clientX;
+        setDragOffsetX(0);
+      }
+    }
+  };
+
+  const handleBtnTouchEnd = (e: React.TouchEvent) => {
+    if (buttonDragRef.current?.timer) {
+      clearTimeout(buttonDragRef.current.timer);
+    }
+    const wasDragging = buttonDragRef.current?.isDragging;
+    buttonDragRef.current = null;
+    setActiveDraggingBtnId(null);
+    setActiveJiggleRowIndex(null);
+    setDragOffsetX(0);
+    if (wasDragging) {
+      e.preventDefault();
+      triggerHaptic('light');
+    }
+  };
+
+  const handleOpenButtonConfig = (blockIndex: number, buttonIndex: number, btn: any) => {
+    triggerHaptic('light');
+    setIsEditorActive(false);
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+    setFocusedBlockIndex(blockIndex);
+    setEditingButtonModal({
+      blockIndex,
+      buttonIndex,
+      ...btn,
+    });
+  };
+
+  const setButtonRowAlign = (blockIndex: number, align: 'left' | 'center' | 'right') => {
+    triggerHaptic('light');
+    const block = currentNote.blocks[blockIndex];
+    if (block.type !== 'button_row') return;
+    updateBlock(blockIndex, { ...block, align }, true);
+  };
+
+  const addButtonToRow = (blockIndex: number) => {
+    const block = currentNote.blocks[blockIndex];
+    if (block.type !== 'button_row') return;
+    if (block.buttons.length >= 3) {
+      triggerHaptic('heavy');
+      alert(t('btn_max_reached'));
+      return;
+    }
+    triggerHaptic('medium');
+    const newBtn = {
+      id: `btn-${Date.now()}`,
+      text: t('btn_new_label'),
+      style: 'default' as const,
+      type: 'url' as const,
+      value: 'https://t.me',
+    };
+    updateBlock(blockIndex, { ...block, buttons: [...block.buttons, newBtn] }, true);
+  };
+
+  const saveEditedButton = () => {
+    if (!editingButtonModal) return;
+    triggerHaptic('light');
+    const { blockIndex, buttonIndex, id, text, style, type, value } = editingButtonModal;
+    const block = currentNote.blocks[blockIndex];
+    if (block?.type === 'button_row') {
+      const nextButtons = [...block.buttons];
+      nextButtons[buttonIndex] = { id, text, style, type, value };
+      updateBlock(blockIndex, { ...block, buttons: nextButtons }, true);
+    }
+    setEditingButtonModal(null);
+  };
+
+  const deleteButtonFromRow = (blockIndex: number, buttonIndex: number) => {
+    triggerHaptic('medium');
+    const block = currentNote.blocks[blockIndex];
+    if (block?.type === 'button_row') {
+      const nextButtons = block.buttons.filter((_, idx) => idx !== buttonIndex);
+      if (nextButtons.length === 0) {
+        removeBlock(blockIndex);
+      } else {
+        updateBlock(blockIndex, { ...block, buttons: nextButtons }, true);
+      }
+    }
+    setEditingButtonModal(null);
+  };
+
   const setCellAlignment = (blockIndex: number, rowIndex: number, colIndex: number, align: 'left' | 'center' | 'right') => {
     triggerHaptic('light');
     const tableBlock = currentNote.blocks[blockIndex];
@@ -721,15 +1603,45 @@ export const EditorView: React.FC<EditorViewProps> = ({
     setTimeout(() => setExportNotice(null), 2500);
   };
 
-  const handleExport = async () => {
-    triggerHaptic('medium');
-    setIsExporting(true);
+  const [showExportModal, setShowExportModal] = useState<boolean>(false);
+  const [selectedExportChannels, setSelectedExportChannels] = useState<string[]>([]);
+  const [sendToUserChat, setSendToUserChat] = useState<boolean>(true);
 
-    const richBlocks: any[] = [];
-    if (currentNote.title.trim()) {
-      richBlocks.push({ type: 'heading', size: 1, text: currentNote.title });
+  const toggleChannelSelection = (chId: string) => {
+    triggerHaptic('light');
+    setSelectedExportChannels((prev) =>
+      prev.includes(chId) ? prev.filter((id) => id !== chId) : [...prev, chId]
+    );
+  };
+
+  const handleExport = async () => {
+    if (selectedExportChannels.length > 0) {
+      const adUrl = 'https://omg10.com/4/11046598';
+      const tg = window.Telegram?.WebApp;
+      try {
+        if (tg?.openLink) {
+          tg.openLink(adUrl);
+        } else {
+          window.open(adUrl, '_blank');
+        }
+      } catch (e) {
+        console.warn('LINK_OPEN_FALLBACK', e);
+      }
     }
 
+    triggerHaptic('medium');
+    setIsExporting(true);
+    const richBlocks: any[] = [];
+    const cleanTitle = currentNote.title.trim();
+    if (cleanTitle) {
+      const titleLines = cleanTitle.split('\n').map((l) => l.trim()).filter(Boolean);
+      if (titleLines.length > 0) {
+        richBlocks.push({ type: 'heading', size: 1, text: titleLines[0] });
+        for (let i = 1; i < titleLines.length; i++) {
+          richBlocks.push({ type: 'paragraph', text: titleLines[i] });
+        }
+      }
+    }
     currentNote.blocks.forEach((b) => {
       if (b.type === 'heading') {
         richBlocks.push({ type: 'heading', size: b.size, text: b.text });
@@ -770,6 +1682,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
           type: 'table',
           is_bordered: b.is_bordered,
           is_striped: b.is_striped,
+          is_compact: b.is_compact,
           cells: b.cells,
         });
       } else if (b.type === 'code') {
@@ -784,15 +1697,67 @@ export const EditorView: React.FC<EditorViewProps> = ({
         });
       } else if (b.type === 'divider') {
         richBlocks.push({ type: 'divider' });
+      } else if (b.type === 'media' && b.images && b.images.length > 0) {
+        richBlocks.push({
+          type: 'media',
+          layout: b.layout || (b.images.length > 1 ? 'collage' : 'single'),
+          images: b.images.map((img) => img.url),
+          caption: b.caption || '',
+        });
+      } else if (b.type === 'audio') {
+        const isSupportedAudio = /\.(mp3|ogg)(\?.*)?$/i.test(b.url);
+        if (isSupportedAudio) {
+          richBlocks.push({
+            type: 'audio',
+            url: b.url,
+            caption: b.caption || '',
+          });
+        } else {
+          richBlocks.push({
+            type: 'document',
+            url: b.url,
+            caption: b.caption || '',
+          });
+        }
+      } else if (b.type === 'file') {
+        richBlocks.push({
+          type: 'document',
+          url: b.url,
+          caption: b.caption || '',
+        });
+      } else if (b.type === 'button_row') {
+        richBlocks.push({
+          type: 'button_row',
+          align: b.align || 'center',
+          buttons: b.buttons.map((btn) => ({
+            text: btn.text,
+            style: btn.style === 'default' ? undefined : btn.style,
+            type: btn.type,
+            url: btn.type === 'url' ? btn.value : undefined,
+            copy_text: btn.type === 'copy_text' ? btn.value : undefined,
+          })),
+        });
+      } else if (b.type === 'footer') {
+        if (b.text && b.text.trim()) {
+          richBlocks.push({
+            type: 'footer',
+            text: b.text,
+          });
+        }
       }
     });
 
     const exportPayload = {
-      ...currentNote,
-      blocks: richBlocks as any,
+      note_id: currentNote.id,
+      note: {
+        ...currentNote,
+        blocks: richBlocks as any,
+      },
+      target_channel_ids: selectedExportChannels,
+      send_to_user: sendToUserChat,
     };
-
     await executeExport(exportPayload);
+    setShowExportModal(false);
   };
 
   return (
@@ -801,56 +1766,95 @@ export const EditorView: React.FC<EditorViewProps> = ({
       className="flex flex-col w-full h-full overflow-y-auto overflow-x-hidden px-6 animate-page-fade relative"
       style={{ paddingBottom: 'calc(var(--keyboard-inset, 0px) + 5rem)' }}
     >
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleFileSelected}
+        className="opacity-0 absolute -z-10 w-0 h-0 pointer-events-none"
+        tabIndex={-1}
+      />
+      <input
+        ref={audioInputRef}
+        type="file"
+        accept="audio/*"
+        onChange={handleAudioFileSelected}
+        className="opacity-0 absolute -z-10 w-0 h-0 pointer-events-none"
+        tabIndex={-1}
+      />
+      <input
+        ref={docFileInputRef}
+        type="file"
+        onChange={handleDocFileSelected}
+        className="opacity-0 absolute -z-10 w-0 h-0 pointer-events-none"
+        tabIndex={-1}
+      />
       <div className="sticky top-0 z-30 bg-[#FAF8F5]/95 safe-header-box pb-2 border-b border-cream-divider flex flex-col gap-2">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1.5">
             <button
               onClick={() => {
                 triggerHaptic();
                 setShowToc(!showToc);
               }}
-              className={`h-7 px-2.5 rounded-full border text-xs font-medium flex items-center gap-1 physics-bounce ${
+              className={`w-7 h-7 rounded-full flex items-center justify-center border transition-all active:scale-95 ${
                 showToc
-                  ? 'bg-warm-accent text-white border-warm-accent'
-                  : 'bg-cream-surface text-warm-text border-cream-divider'
+                  ? 'bg-warm-accent text-white border-warm-accent shadow-xs'
+                  : 'bg-cream-surface/80 text-warm-muted border-cream-divider/70 hover:text-warm-text'
               }`}
             >
-              <span className="material-symbols-outlined text-[15px]">toc</span>
-              <span>{t('toc_title')}</span>
+              <span className="material-symbols-outlined text-[16px]">toc</span>
             </button>
-            <div className="flex items-center bg-cream-surface rounded-full border border-cream-divider px-0.5">
+            <div className="flex items-center bg-cream-surface/80 rounded-full border border-cream-divider/70 p-0.5">
               <button
                 onClick={handleUndo}
                 disabled={historyIndex <= 0}
-                className="w-6 h-6 flex items-center justify-center text-warm-text disabled:opacity-30 physics-bounce"
+                className="w-6 h-6 rounded-full flex items-center justify-center text-warm-muted hover:text-warm-text disabled:opacity-20 active:scale-90 transition-transform"
               >
-                <span className="material-symbols-outlined text-[15px]">undo</span>
+                <span className="material-symbols-outlined text-[14px]">undo</span>
               </button>
               <button
                 onClick={handleRedo}
                 disabled={historyIndex >= history.length - 1}
-                className="w-6 h-6 flex items-center justify-center text-warm-text disabled:opacity-30 physics-bounce"
+                className="w-6 h-6 rounded-full flex items-center justify-center text-warm-muted hover:text-warm-text disabled:opacity-20 active:scale-90 transition-transform"
               >
-                <span className="material-symbols-outlined text-[15px]">redo</span>
+                <span className="material-symbols-outlined text-[14px]">redo</span>
               </button>
             </div>
           </div>
-
           <div className="flex items-center gap-1.5">
             <button
-              onClick={handleExport}
+              onClick={() => {
+                triggerHaptic('light');
+                setIsEditorActive(false);
+                if (document.activeElement instanceof HTMLElement) {
+                  document.activeElement.blur();
+                }
+                setShowExportModal(true);
+              }}
               disabled={isExporting}
-              className="h-7 px-3 rounded-full bg-warm-text text-[#FAF8F5] text-xs font-medium flex items-center gap-1.5 physics-bounce min-w-[70px] justify-center"
+              className={`h-7 px-3 rounded-full text-xs font-medium flex items-center gap-1.5 active:scale-95 transition-all disabled:opacity-80 ${
+                selectedExportChannels.length > 0
+                  ? 'bg-warm-accent text-[#FAF8F5]'
+                  : 'bg-warm-text text-[#FAF8F5]'
+              }`}
             >
               {isExporting ? (
                 <>
-                  <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin-fast" />
-                  <span>{t('exporting')}</span>
+                  <div className="w-2.5 h-2.5 rounded-full border-[1.5px] border-white/20 border-t-white animate-spin" />
+                  <span className="text-[11px] font-normal">{t('exporting')}</span>
                 </>
               ) : (
                 <>
-                  <span className="material-symbols-outlined text-[14px]">send</span>
-                  <span>{exportNotice || t('export_rich')}</span>
+                  <span className="material-symbols-outlined text-[13px]">
+                    {selectedExportChannels.length > 0 ? 'campaign' : 'ios_share'}
+                  </span>
+                  <span>
+                    {exportNotice ||
+                      (selectedExportChannels.length > 0
+                        ? t('export_with_ad')
+                        : t('export_rich'))}
+                  </span>
                 </>
               )}
             </button>
@@ -861,14 +1865,13 @@ export const EditorView: React.FC<EditorViewProps> = ({
                   onDelete(currentNote.id);
                 }
               }}
-              className="w-7 h-7 flex items-center justify-center text-warm-muted hover:text-red-600 physics-bounce"
+              className="w-7 h-7 rounded-full flex items-center justify-center text-warm-subtle hover:text-red-600 active:scale-90 transition-all"
             >
-              <span className="material-symbols-outlined text-[18px]">delete</span>
+              <span className="material-symbols-outlined text-[16px]">delete_outline</span>
             </button>
           </div>
         </div>
-
-        <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5 border-t border-cream-divider/40">
+        <div className="flex items-center gap-1 overflow-x-auto no-scrollbar py-0.5">
           {topics.map((cat) => (
             <button
               key={cat.id}
@@ -876,10 +1879,10 @@ export const EditorView: React.FC<EditorViewProps> = ({
                 triggerHaptic();
                 persistChange({ ...currentNote, category: cat.id }, true);
               }}
-              className={`text-[10px] px-2.5 py-0.5 rounded font-medium uppercase tracking-wider shrink-0 transition-colors ${
+              className={`text-[10px] px-2.5 py-0.5 rounded-full font-medium uppercase tracking-wider shrink-0 transition-colors ${
                 currentNote.category === cat.id
                   ? 'bg-warm-accent text-white'
-                  : 'bg-cream-surface text-warm-muted'
+                  : 'text-warm-muted hover:text-warm-text hover:bg-cream-surface/60'
               }`}
             >
               {cat.name}
@@ -888,7 +1891,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
         </div>
 
         <div className="flex items-center justify-between border-b border-cream-divider/40 pb-1 text-xs">
-          {(['text', 'lists', 'quotes', 'table', 'objects'] as const).map((tabKey) => {
+          {(['text', 'lists', 'quotes', 'media', 'table', 'objects'] as const).map((tabKey) => {
             const isActive = activeToolbarTab === tabKey;
             const labelKey = `tab_${tabKey}` as any;
             return (
@@ -959,29 +1962,74 @@ export const EditorView: React.FC<EditorViewProps> = ({
           )}
 
           {activeToolbarTab === 'quotes' && (
-            <>
-              <button
-                onClick={() => appendBlockWithParagraph('quote')}
-                className="px-2.5 py-1 rounded-full bg-cream-surface text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce"
-              >
-                <span>{t('tool_quote_block')}</span>
-              </button>
-              <button
-                onClick={() => appendBlockWithParagraph('expandable_quote')}
-                className="px-2.5 py-1 rounded-full bg-cream-surface text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce"
-              >
-                <span>{t('tool_quote_expand')}</span>
-              </button>
-              <button
-                onClick={() => appendBlockWithParagraph('pullquote')}
-                className="px-2.5 py-1 rounded-full bg-cream-surface text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce"
-              >
-                <span>{t('tool_quote_pull')}</span>
-              </button>
-            </>
-          )}
-
-          {activeToolbarTab === 'table' && (
+  <>
+    <button
+      onClick={() => appendBlockWithParagraph('quote')}
+      className="px-2.5 py-1 rounded-full bg-cream-surface text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce"
+    >
+      <span>{t('tool_quote_block')}</span>
+    </button>
+    <button
+      onClick={() => appendBlockWithParagraph('expandable_quote')}
+      className="px-2.5 py-1 rounded-full bg-cream-surface text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce"
+    >
+      <span>{t('tool_quote_expand')}</span>
+    </button>
+    <button
+      onClick={() => appendBlockWithParagraph('pullquote')}
+      className="px-2.5 py-1 rounded-full bg-cream-surface text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce"
+    >
+      <span>{t('tool_quote_pull')}</span>
+    </button>
+  </>
+)}
+{activeToolbarTab === 'media' && (
+  <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
+    <button
+      type="button"
+      onClick={() => appendBlockWithParagraph('media')}
+      disabled={totalImageCount >= 2 || isUploadingGlobal}
+      className="px-2.5 py-1 rounded-full bg-warm-accent text-white text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce disabled:opacity-40"
+    >
+      {isUploadingGlobal && uploadingMediaType === 'image' ? (
+        <div className="w-3 h-3 border-2 border-white/40 border-t-white rounded-full animate-spin-fast" />
+      ) : (
+        <span className="material-symbols-outlined text-[14px]">image</span>
+      )}
+      <span>{t('tool_image')}</span>
+      <span className="text-[10px] font-mono opacity-80">{totalImageCount}/2</span>
+    </button>
+    <button
+      type="button"
+      onClick={triggerUploadAudio}
+      disabled={totalAudioCount >= 1 || isUploadingGlobal}
+      className="px-2.5 py-1 rounded-full bg-cream-surface text-warm-text text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce disabled:opacity-40"
+    >
+      {isUploadingGlobal && uploadingMediaType === 'audio' ? (
+        <div className="w-3 h-3 border-2 border-warm-accent border-t-transparent rounded-full animate-spin-fast" />
+      ) : (
+        <span className="material-symbols-outlined text-[14px] text-warm-accent">audiotrack</span>
+      )}
+      <span>{t('tool_audio')}</span>
+      <span className="text-[10px] font-mono text-warm-muted">{totalAudioCount}/1</span>
+    </button>
+    <button
+      type="button"
+      onClick={triggerUploadDoc}
+      disabled={totalFileCount >= 1 || isUploadingGlobal}
+      className="px-2.5 py-1 rounded-full bg-cream-surface text-warm-text text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce disabled:opacity-40"
+    >
+      {isUploadingGlobal && uploadingMediaType === 'file' ? (
+        <div className="w-3 h-3 border-2 border-warm-accent border-t-transparent rounded-full animate-spin-fast" />
+      ) : (
+        <span className="material-symbols-outlined text-[14px] text-warm-accent">attach_file</span>
+      )}
+      <span>{t('tool_file')}</span>
+      <span className="text-[10px] font-mono text-warm-muted">{totalFileCount}/1</span>
+    </button>
+  </div>
+)}
+{activeToolbarTab === 'table' && (
             <button
               onClick={() => appendBlockWithParagraph('table')}
               className="px-3 py-1 rounded-full bg-warm-accent text-white text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce"
@@ -1020,6 +2068,20 @@ export const EditorView: React.FC<EditorViewProps> = ({
               >
                 <span className="material-symbols-outlined text-[14px]">horizontal_rule</span>
                 <span>{t('tool_divider')}</span>
+              </button>
+              <button
+                onClick={() => appendBlockWithParagraph('button_row')}
+                className="px-2.5 py-1 rounded-full bg-cream-surface text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce"
+              >
+                <span className="material-symbols-outlined text-[14px] text-warm-accent">smart_button</span>
+                <span>{t('tool_button')}</span>
+              </button>
+              <button
+                onClick={() => appendBlockWithParagraph('footer')}
+                className="px-2.5 py-1 rounded-full bg-cream-surface text-xs font-medium flex items-center gap-1 shrink-0 physics-bounce"
+              >
+                <span className="material-symbols-outlined text-[14px] text-warm-accent">short_text</span>
+                <span>{t('tool_footer')}</span>
               </button>
             </>
           )}
@@ -1070,11 +2132,23 @@ export const EditorView: React.FC<EditorViewProps> = ({
           placeholder={t('title_placeholder')}
           onFocus={() => setFocusedBlockIndex(null)}
           onInput={(e) => autoResize(e.currentTarget)}
-          onChange={(e) => handleTitleChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              triggerHaptic('light');
+              const firstBlock = currentNote.blocks[0];
+              if (firstBlock) {
+                const el = blockElementRefs.current[firstBlock.id];
+                const editable = el?.querySelector<HTMLElement>('[contenteditable="true"], input, textarea');
+                editable?.focus();
+              }
+            }
+          }}
+          onChange={(e) => handleTitleChange(e.target.value.replace(/\r?\n/g, ' '))}
           className="text-2xl font-bold tracking-tight text-warm-text bg-transparent border-none focus:outline-none placeholder:text-warm-subtle w-full mb-3 resize-none overflow-hidden"
         />
 
-        <div className="flex flex-col gap-2.5 min-h-[300px] w-full min-w-0">
+        <div className="flex flex-col gap-1.5 min-h-[300px] w-full min-w-0">
           {currentNote.blocks.map((block, index) => (
             <div
               key={block.id}
@@ -1090,6 +2164,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                     placeholder={t('paragraph_placeholder')}
                     onFocus={() => setFocusedBlockIndex(index)}
                     onChange={(newHtml) => updateBlock(index, { ...block, text: newHtml })}
+                    onKeyDown={(e) => handleParagraphKeyDown(e, index)}
                     className="w-full text-[15px] leading-relaxed text-warm-text bg-transparent border-none focus:outline-none min-h-[24px]"
                   />
                 )}
@@ -1114,7 +2189,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                 )}
 
                 {block.type === 'quote' && (
-                  <div className="border-l-2 border-warm-accent pl-3 py-0.5 my-1 flex flex-col gap-1">
+                  <div className="w-full my-1.5 rounded-r-xl border-l-[3.5px] border-warm-accent bg-cream-surface/75 px-3 py-2.5 flex flex-col gap-1.5 transition-all">
                     <textarea
                       rows={1}
                       value={block.text}
@@ -1125,7 +2200,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       onFocus={() => setFocusedBlockIndex(index)}
                       onInput={(e) => autoResize(e.currentTarget)}
                       onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
-                      className="w-full text-[15px] italic text-[#4A3828] bg-transparent border-none focus:outline-none resize-none overflow-hidden"
+                      className="w-full text-[14.5px] text-warm-text leading-relaxed bg-transparent border-none focus:outline-none resize-none overflow-hidden"
                     />
                     <input
                       type="text"
@@ -1133,13 +2208,18 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       placeholder={t('quote_credit_placeholder')}
                       onFocus={() => setFocusedBlockIndex(index)}
                       onChange={(e) => updateBlock(index, { ...block, credit: e.target.value })}
-                      className="w-full text-xs font-medium text-warm-accent bg-transparent border-none focus:outline-none"
+                      className="w-full text-[11px] font-medium text-warm-accent bg-transparent border-none focus:outline-none tracking-wide"
                     />
                   </div>
                 )}
-
                 {block.type === 'expandable_quote' && (
-                  <div className="border-l-2 border-dashed border-warm-accent pl-3 py-0.5 my-1 flex flex-col gap-1 bg-cream-surface/40 rounded-r">
+                  <div className="w-full my-1.5 rounded-r-xl border-l-[3.5px] border-warm-accent bg-cream-surface/75 px-3 py-2.5 flex flex-col gap-1.5 transition-all">
+                    <div className="flex items-center justify-between pb-1 border-b border-cream-divider/50">
+                      <span className="text-[10px] font-semibold text-warm-accent uppercase tracking-wider flex items-center gap-1">
+                        <span className="material-symbols-outlined text-[13px]">unfold_more</span>
+                        <span>{t('tool_quote_expand')}</span>
+                      </span>
+                    </div>
                     <textarea
                       rows={1}
                       value={block.text}
@@ -1150,7 +2230,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       onFocus={() => setFocusedBlockIndex(index)}
                       onInput={(e) => autoResize(e.currentTarget)}
                       onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
-                      className="w-full text-[15px] italic text-warm-text bg-transparent border-none focus:outline-none resize-none overflow-hidden"
+                      className="w-full text-[14.5px] text-warm-text leading-relaxed bg-transparent border-none focus:outline-none resize-none overflow-hidden"
                     />
                     <input
                       type="text"
@@ -1158,7 +2238,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       placeholder={t('quote_credit_placeholder')}
                       onFocus={() => setFocusedBlockIndex(index)}
                       onChange={(e) => updateBlock(index, { ...block, credit: e.target.value })}
-                      className="w-full text-xs font-medium text-warm-accent bg-transparent border-none focus:outline-none"
+                      className="w-full text-[11px] font-medium text-warm-accent bg-transparent border-none focus:outline-none tracking-wide"
                     />
                   </div>
                 )}
@@ -1281,7 +2361,254 @@ export const EditorView: React.FC<EditorViewProps> = ({
                     </button>
                   </div>
                 )}
+                {block.type === 'audio' && (
+                  <div className="my-2.5 p-3 rounded-2xl bg-cream-surface/75 border border-cream-divider/80 flex flex-col gap-2.5 shadow-xs w-full min-w-0 transition-all">
+                    <div className="flex items-center justify-between gap-2 border-b border-cream-divider/50 pb-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className="w-8 h-8 rounded-full bg-warm-accent/10 text-warm-accent flex items-center justify-center shrink-0">
+                          <span className="material-symbols-outlined text-[18px]">audiotrack</span>
+                        </div>
+                        <div className="flex flex-col min-w-0">
+                          <span className="text-xs font-semibold text-warm-text truncate">{block.name}</span>
+                          <span className="text-[10px] font-mono text-warm-muted">{formatFileSize(block.size)}</span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => removeBlock(index)}
+                        className="w-6 h-6 rounded-full text-warm-subtle hover:text-red-600 flex items-center justify-center physics-bounce"
+                      >
+                        <span className="material-symbols-outlined text-[15px]">close</span>
+                      </button>
+                    </div>
+                    <audio
+                      controls
+                      preload="none"
+                      src={block.url}
+                      className="w-full h-8 rounded-lg outline-none"
+                    />
+                    <div className="border-t border-cream-divider/40 pt-1">
+                      <input
+                        type="text"
+                        value={block.caption || ''}
+                        placeholder={t('audio_caption_placeholder')}
+                        onFocus={() => setFocusedBlockIndex(index)}
+                        onChange={(e) => updateBlock(index, { ...block, caption: e.target.value })}
+                        className="w-full text-xs font-normal text-warm-text bg-transparent border-none focus:outline-none placeholder:text-warm-subtle"
+                      />
+                    </div>
+                  </div>
+                )}
+                {block.type === 'file' && (
+                  <div className="my-2.5 p-3 rounded-2xl bg-cream-surface/75 border border-cream-divider/80 flex flex-col gap-2 shadow-xs w-full min-w-0 transition-all">
+                    <div className="flex items-center justify-between gap-2">
+                      <a
+                        href={block.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center gap-2.5 min-w-0 flex-1 group/doc"
+                      >
+                        <div className="w-8 h-8 rounded-xl bg-warm-text text-[#FAF8F5] flex items-center justify-center shrink-0">
+                          <span className="material-symbols-outlined text-[18px]">attachment</span>
+                        </div>
+                        <div className="flex flex-col min-w-0">
+                          <span className="text-xs font-semibold text-warm-text group-hover/doc:text-warm-accent truncate transition-colors">{block.name}</span>
+                          <span className="text-[10px] font-mono text-warm-muted">{formatFileSize(block.size)}</span>
+                        </div>
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => removeBlock(index)}
+                        className="w-6 h-6 rounded-full text-warm-subtle hover:text-red-600 flex items-center justify-center physics-bounce"
+                      >
+                        <span className="material-symbols-outlined text-[15px]">close</span>
+                      </button>
+                    </div>
+                    <div className="border-t border-cream-divider/40 pt-1">
+                      <input
+                        type="text"
+                        value={block.caption || ''}
+                        placeholder={t('file_caption_placeholder')}
+                        onFocus={() => setFocusedBlockIndex(index)}
+                        onChange={(e) => updateBlock(index, { ...block, caption: e.target.value })}
+                        className="w-full text-xs font-normal text-warm-text bg-transparent border-none focus:outline-none placeholder:text-warm-subtle"
+                      />
+                    </div>
+                  </div>
+                )}
+                {block.type === 'media' && (
+                  <div className="flex flex-col gap-2 my-2 w-full min-w-0">
+                    {block.images.length === 2 && (
+                      <div className="flex items-center justify-between pb-1">
+                        <div className="flex items-center bg-cream-surface border border-cream-divider rounded-full p-0.5">
+                          <button
+                            type="button"
+                            onClick={() => toggleMediaLayout(index, 'collage')}
+                            className={`px-3 py-0.5 text-xs font-medium rounded-full transition-all duration-200 flex items-center gap-1 ${
+                              block.layout === 'collage'
+                                ? 'bg-warm-accent text-white'
+                                : 'text-warm-muted hover:text-warm-text'
+                            }`}
+                          >
+                            <span className="material-symbols-outlined text-[14px]">grid_view</span>
+                            <span>{t('layout_collage')}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => toggleMediaLayout(index, 'slideshow')}
+                            className={`px-3 py-0.5 text-xs font-medium rounded-full transition-all duration-200 flex items-center gap-1 ${
+                              block.layout === 'slideshow'
+                                ? 'bg-warm-accent text-white'
+                                : 'text-warm-muted hover:text-warm-text'
+                            }`}
+                          >
+                            <span className="material-symbols-outlined text-[14px]">view_carousel</span>
+                            <span>{t('layout_slideshow')}</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
+                    <div className="relative w-full rounded-xl overflow-hidden bg-cream-surface/60 border border-cream-divider">
+                      {block.layout === 'slideshow' && block.images.length === 2 ? (
+                        <div className="relative w-full flex flex-col items-center">
+                          <div className="relative w-full h-56 overflow-hidden">
+                            {block.images.map((img, imgIdx) => {
+                              const activeIdx = activeSlideIndices[block.id] || 0;
+                              const isCurrent = activeIdx === imgIdx;
+                              return (
+                                <div
+                                    key={img.id}
+                                    className={`absolute inset-0 transition-opacity duration-300 ease-out flex items-center justify-center ${
+                                      isCurrent ? 'opacity-100 z-10' : 'opacity-0 pointer-events-none z-0'
+                                    }`}
+                                  >
+                                    <img
+                                      src={img.url}
+                                      alt="slideshow frame"
+                                      className="w-full h-full object-cover"
+                                      loading="lazy"
+                                      referrerPolicy="no-referrer"
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() => removeImageFromBlock(index, imgIdx)}
+                                      className="absolute top-2 right-2 w-6 h-6 rounded-full bg-[#24201D]/75 text-white flex items-center justify-center text-xs hover:bg-red-600 transition-colors"
+                                    >
+                                      <span className="material-symbols-outlined text-[14px]">close</span>
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            <div className="w-full flex items-center justify-between px-3 py-1.5 bg-cream-surface/80 border-t border-cream-divider">
+                              <button
+                                type="button"
+                                onClick={() => handleSlideNav(block.id, 'prev', block.images.length)}
+                                className="w-6 h-6 rounded-full flex items-center justify-center text-warm-text hover:bg-cream-divider transition-colors"
+                              >
+                                <span className="material-symbols-outlined text-[16px]">chevron_left</span>
+                              </button>
+                              <div className="flex items-center gap-1.5">
+                                {block.images.map((_, dotIdx) => {
+                                  const activeIdx = activeSlideIndices[block.id] || 0;
+                                  return (
+                                    <span
+                                      key={dotIdx}
+                                      className={`w-2 h-2 rounded-full transition-colors ${
+                                        activeIdx === dotIdx ? 'bg-warm-accent' : 'bg-cream-divider'
+                                      }`}
+                                    />
+                                  );
+                                })}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleSlideNav(block.id, 'next', block.images.length)}
+                                className="w-6 h-6 rounded-full flex items-center justify-center text-warm-text hover:bg-cream-divider transition-colors"
+                              >
+                                <span className="material-symbols-outlined text-[16px]">chevron_right</span>
+                              </button>
+                            </div>
+                          </div>
+                        ) : block.layout === 'collage' && block.images.length === 2 ? (
+                          <div className="grid grid-cols-2 gap-1.5 p-1.5 transition-all duration-200">
+                            {block.images.map((img, imgIdx) => (
+                              <div key={img.id} className="relative h-44 rounded-lg overflow-hidden group/img">
+                                <img
+                                  src={img.url}
+                                  alt="collage thumb"
+                                  className="w-full h-full object-cover"
+                                  loading="lazy"
+                                  referrerPolicy="no-referrer"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => removeImageFromBlock(index, imgIdx)}
+                                  className="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-[#24201D]/75 text-white flex items-center justify-center text-xs hover:bg-red-600 transition-colors"
+                                >
+                                  <span className="material-symbols-outlined text-[14px]">close</span>
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="relative w-full max-h-72 overflow-hidden flex items-center justify-center">
+                            {block.images[0] && (
+                              <>
+                                <img
+                                  src={block.images[0].url}
+                                  alt="single preview"
+                                  className="w-full max-h-72 object-cover rounded-xl"
+                                  loading="lazy"
+                                  referrerPolicy="no-referrer"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => removeImageFromBlock(index, 0)}
+                                  className="absolute top-2 right-2 w-6 h-6 rounded-full bg-[#24201D]/75 text-white flex items-center justify-center text-xs hover:bg-red-600 transition-colors"
+                                >
+                                  <span className="material-symbols-outlined text-[14px]">close</span>
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        )}
+
+                      {uploadingBlockId === block.id && (
+                        <div className="absolute inset-0 bg-[#FAF8F5]/85 flex items-center justify-center z-20">
+                          <div className="flex items-center gap-2 text-xs font-medium text-warm-accent">
+                            <div className="w-4 h-4 border-2 border-warm-accent/30 border-t-warm-accent rounded-full animate-spin-fast" />
+                            <span>{t('image_uploading')}</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {block.images.length === 1 && totalImageCount < 2 && (
+                      <button
+                        type="button"
+                        onClick={() => triggerAddSecondImage(index)}
+                        disabled={isUploadingGlobal}
+                        className="self-start text-xs font-medium text-warm-accent flex items-center gap-1 px-2.5 py-1 rounded-full bg-cream-surface border border-cream-divider physics-bounce disabled:opacity-40"
+                      >
+                        <span className="material-symbols-outlined text-[14px]">add</span>
+                        <span>{t('add_second_image')}</span>
+                      </button>
+                    )}
+
+                    <div className="border-b border-cream-divider/70 pb-1">
+                      <input
+                        type="text"
+                        value={block.caption || ''}
+                        placeholder={t('image_caption_placeholder')}
+                        onFocus={() => setFocusedBlockIndex(index)}
+                        onChange={(e) => updateBlock(index, { ...block, caption: e.target.value })}
+                        className="w-full text-xs font-normal text-warm-text bg-transparent border-none focus:outline-none placeholder:text-warm-subtle"
+                      />
+                    </div>
+                  </div>
+                )}
                 {block.type === 'table' && (
                   <div className="flex flex-col gap-1.5 my-3 w-full min-w-0 max-w-full">
                     <div
@@ -1290,43 +2617,49 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       }`}
                     >
                       <div
-                        className={`flex items-center justify-between px-2.5 bg-cream-surface transition-all duration-150 ease-out overflow-x-auto no-scrollbar gap-2 ${
+                        className={`flex items-center justify-between px-2.5 py-1.5 bg-cream-surface overflow-x-auto no-scrollbar gap-2 ${
                           block.is_bordered ? 'border-b border-cream-divider' : ''
-                        } ${
-                          focusedBlockIndex === index
-                            ? 'max-h-12 py-1.5 opacity-100'
-                            : 'max-h-0 py-0 opacity-0 pointer-events-none'
                         }`}
                       >
                         <div className="flex items-center gap-1">
-                          {activeTableCell && activeTableCell.blockIndex === index && (
-                            <div className="flex items-center bg-[#FAF8F5] border border-cream-divider rounded-lg p-0.5">
-                              <button
-                                onMouseDown={(e) => e.preventDefault()}
-                                onClick={() => setCellAlignment(index, activeTableCell.rowIndex, activeTableCell.colIndex, 'left')}
-                                className="w-6 h-6 flex items-center justify-center rounded text-warm-muted hover:text-warm-text active:scale-90 transition-transform"
-                              >
-                                <span className="material-symbols-outlined text-[14px]">format_align_left</span>
-                              </button>
-                              <button
-                                onMouseDown={(e) => e.preventDefault()}
-                                onClick={() => setCellAlignment(index, activeTableCell.rowIndex, activeTableCell.colIndex, 'center')}
-                                className="w-6 h-6 flex items-center justify-center rounded text-warm-muted hover:text-warm-text active:scale-90 transition-transform"
-                              >
-                                <span className="material-symbols-outlined text-[14px]">format_align_center</span>
-                              </button>
-                              <button
-                                onMouseDown={(e) => e.preventDefault()}
-                                onClick={() => setCellAlignment(index, activeTableCell.rowIndex, activeTableCell.colIndex, 'right')}
-                                className="w-6 h-6 flex items-center justify-center rounded text-warm-muted hover:text-warm-text active:scale-90 transition-transform"
-                              >
-                                <span className="material-symbols-outlined text-[14px]">format_align_right</span>
-                              </button>
-                            </div>
-                          )}
-
+                          <div
+                            className={`flex items-center bg-[#FAF8F5] border border-cream-divider rounded-lg p-0.5 transition-all duration-200 ease-out origin-left ${
+                              activeTableCell && activeTableCell.blockIndex === index
+                                ? 'opacity-100 scale-100 max-w-[96px] mr-1 pointer-events-auto'
+                                : 'opacity-0 scale-90 max-w-0 mr-0 pointer-events-none p-0 border-transparent overflow-hidden'
+                            }`}
+                          >
+                            <button
+                              type="button"
+                              tabIndex={activeTableCell && activeTableCell.blockIndex === index ? 0 : -1}
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => activeTableCell && setCellAlignment(index, activeTableCell.rowIndex, activeTableCell.colIndex, 'left')}
+                              className="w-6 h-6 flex items-center justify-center rounded text-warm-muted hover:text-warm-text active:scale-90 transition-transform"
+                            >
+                              <span className="material-symbols-outlined text-[14px]">format_align_left</span>
+                            </button>
+                            <button
+                              type="button"
+                              tabIndex={activeTableCell && activeTableCell.blockIndex === index ? 0 : -1}
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => activeTableCell && setCellAlignment(index, activeTableCell.rowIndex, activeTableCell.colIndex, 'center')}
+                              className="w-6 h-6 flex items-center justify-center rounded text-warm-muted hover:text-warm-text active:scale-90 transition-transform"
+                            >
+                              <span className="material-symbols-outlined text-[14px]">format_align_center</span>
+                            </button>
+                            <button
+                              type="button"
+                              tabIndex={activeTableCell && activeTableCell.blockIndex === index ? 0 : -1}
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => activeTableCell && setCellAlignment(index, activeTableCell.rowIndex, activeTableCell.colIndex, 'right')}
+                              className="w-6 h-6 flex items-center justify-center rounded text-warm-muted hover:text-warm-text active:scale-90 transition-transform"
+                            >
+                              <span className="material-symbols-outlined text-[14px]">format_align_right</span>
+                            </button>
+                          </div>
                           <div className="flex items-center gap-0.5">
                             <button
+                              type="button"
                               onMouseDown={(e) => e.preventDefault()}
                               onClick={() => toggleTableBorder(index)}
                               className={`p-1 rounded-lg transition-colors active:scale-90 ${
@@ -1336,6 +2669,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                               <span className="material-symbols-outlined text-[15px]">border_all</span>
                             </button>
                             <button
+                              type="button"
                               onMouseDown={(e) => e.preventDefault()}
                               onClick={() => toggleTableStriped(index)}
                               className={`p-1 rounded-lg transition-colors active:scale-90 ${
@@ -1344,28 +2678,41 @@ export const EditorView: React.FC<EditorViewProps> = ({
                             >
                               <span className="material-symbols-outlined text-[15px]">table_rows</span>
                             </button>
+                            <button
+                              type="button"
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => toggleTableCompact(index)}
+                              className={`p-1 rounded-lg transition-colors active:scale-90 ${
+                                block.is_compact ? 'text-warm-accent bg-warm-accent-light' : 'text-warm-muted hover:text-warm-text'
+                              }`}
+                            >
+                              <span className="material-symbols-outlined text-[15px] leading-none">view_compact</span>
+                            </button>
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-1">
+                        <div className="flex items-center bg-[#FAF8F5] border border-cream-divider rounded-lg p-0.5 shrink-0">
+                          <span className="text-[10px] font-semibold text-warm-accent pl-1 pr-0.5 uppercase tracking-wider flex items-center gap-0.5">
+                            <span className="material-symbols-outlined text-[13px] leading-none rotate-90">table_rows</span>
+                          </span>
                           <button
+                            type="button"
+                            title={t('add_col')}
                             onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => removeTableRow(index, activeTableCell?.rowIndex)}
-                            disabled={block.cells.length <= 1}
-                            className="px-2 py-1 rounded-md text-[11px] font-medium text-warm-muted hover:text-red-600 disabled:opacity-30 flex items-center gap-0.5 active:scale-90 transition-transform"
+                            onClick={() => addTableColumn(index)}
+                            className="w-5 h-5 flex items-center justify-center rounded text-warm-muted hover:text-warm-accent active:scale-90 transition-transform"
                           >
-                            <span className="material-symbols-outlined text-[13px]">delete</span>
-                            <span>{t('del_row').replace(/^[+\-–]\s*/, '')}</span>
+                            <span className="material-symbols-outlined text-[13px] leading-none">add</span>
                           </button>
-                          <span className="h-3 w-[1px] bg-cream-divider mx-0.5" />
                           <button
+                            type="button"
+                            title={t('del_col')}
                             onMouseDown={(e) => e.preventDefault()}
                             onClick={() => removeTableColumn(index, activeTableCell?.colIndex)}
                             disabled={(block.cells[0]?.length || 0) <= 1}
-                            className="px-2 py-1 rounded-md text-[11px] font-medium text-warm-muted hover:text-red-600 disabled:opacity-30 flex items-center gap-0.5 active:scale-90 transition-transform"
+                            className="w-5 h-5 flex items-center justify-center rounded text-warm-muted hover:text-red-600 disabled:opacity-20 active:scale-90 transition-transform"
                           >
-                            <span className="material-symbols-outlined text-[13px]">delete</span>
-                            <span>{t('del_col').replace(/^[+\-–]\s*/, '')}</span>
+                            <span className="material-symbols-outlined text-[13px] leading-none">remove</span>
                           </button>
                         </div>
                       </div>
@@ -1382,9 +2729,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
                                 key={rIdx}
                                 className={`${
                                   rIdx === 0
-                                    ? `bg-cream-surface/80 font-semibold text-warm-text ${
-                                        block.is_bordered ? 'border-b border-cream-divider' : ''
-                                      }`
+                                    ? `bg-cream-surface/80 font-semibold text-warm-text`
                                     : block.is_striped && rIdx % 2 === 1
                                     ? 'bg-cream-surface/35'
                                     : 'bg-transparent'
@@ -1393,20 +2738,19 @@ export const EditorView: React.FC<EditorViewProps> = ({
                                 {row.map((col, cIdx) => (
                                   <td
                                     key={cIdx}
-                                    className={`p-0 relative min-w-0 ${
+                                    style={{ outline: 'none' }}
+                                    className={`p-0 relative min-w-0 outline-none ${
                                       (block.cells[0]?.length || 0) > 2 ? 'min-w-[100px]' : ''
                                     } ${
                                       block.is_bordered
-                                        ? `border-cream-divider ${rIdx < block.cells.length - 1 ? 'border-b' : ''} ${
-                                            cIdx < row.length - 1 ? 'border-r' : ''
-                                          }`
-                                        : 'border-none'
+                                        ? 'border border-cream-divider'
+                                        : 'border border-transparent'
                                     }`}
                                   >
                                     <input
                                       type="text"
                                       value={col.text}
-                                      placeholder={rIdx === 0 ? `${t('table_col')} ${cIdx + 1}` : `${t('table_cell')} ${rIdx + 1}`}
+                                      placeholder={rIdx === 0 ? `${t('table_col')} ${cIdx + 1}` : `${t('table_row')} ${rIdx + 1}`}
                                       onFocus={() => {
                                         setFocusedBlockIndex(index);
                                         setActiveTableCell({ blockIndex: index, rowIndex: rIdx, colIndex: cIdx });
@@ -1417,36 +2761,15 @@ export const EditorView: React.FC<EditorViewProps> = ({
                                         );
                                         updateBlock(index, { ...block, cells: nextCells }, false);
                                       }}
-                                      className={`w-full min-w-0 bg-transparent border-none focus:outline-none text-warm-text px-2.5 py-1.5 font-medium ${
+                                      style={{ outline: 'none', boxShadow: 'none' }}
+                                      className={`w-full min-w-0 bg-transparent border-none outline-none focus:outline-none focus:ring-0 text-warm-text font-medium transition-all ${
+                                        block.is_compact ? 'px-1.5 py-0.5 text-[11px]' : 'px-2.5 py-1.5 text-xs'
+                                      } ${
                                         col.align === 'center' ? 'text-center' : col.align === 'right' ? 'text-right' : 'text-left'
                                       }`}
                                     />
                                   </td>
                                 ))}
-                                {rIdx === 0 ? (
-                                  <th
-                                    style={{ width: '32px', minWidth: '32px', maxWidth: '32px' }}
-                                    className={`w-8 min-w-[32px] max-w-[32px] p-0 text-center align-middle ${
-                                      block.is_bordered ? 'border-b border-cream-divider bg-cream-surface/60' : 'bg-cream-surface/30'
-                                    }`}
-                                  >
-                                    <button
-                                      onMouseDown={(e) => e.preventDefault()}
-                                      onClick={() => addTableColumn(index)}
-                                      className="w-full h-full min-h-[30px] flex items-center justify-center text-warm-muted hover:text-warm-accent active:scale-90 transition-transform"
-                                      title={t('add_col').replace(/^[+\-–]\s*/, '')}
-                                    >
-                                      <span className="material-symbols-outlined text-[15px]">add</span>
-                                    </button>
-                                  </th>
-                                ) : (
-                                  <td
-                                    style={{ width: '32px', minWidth: '32px', maxWidth: '32px' }}
-                                    className={`w-8 min-w-[32px] max-w-[32px] p-0 ${
-                                      block.is_bordered && rIdx < block.cells.length - 1 ? 'border-b border-cream-divider/30' : ''
-                                    }`}
-                                  />
-                                )}
                               </tr>
                             ))}
                           </tbody>
@@ -1454,28 +2777,52 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       </div>
 
                       <div
-                        className={`flex items-center justify-between px-3 py-1 bg-cream-surface/30 ${
+                        className={`flex items-center px-2.5 py-1.5 bg-cream-surface/40 ${
                           block.is_bordered ? 'border-t border-cream-divider' : ''
                         }`}
                       >
-                        <button
-                          onMouseDown={(e) => e.preventDefault()}
-                          onClick={() => addTableRow(index)}
-                          className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium text-warm-muted hover:text-warm-accent active:scale-90 transition-transform"
-                        >
-                          <span className="material-symbols-outlined text-[14px]">add</span>
-                          <span>{t('add_row').replace(/^[+\-–]\s*/, '')}</span>
-                        </button>
-                        <span className="text-[10px] font-mono text-warm-subtle">
-                          {block.cells.length} × {block.cells[0]?.length || 0}
-                        </span>
+                        <div className="flex items-center bg-[#FAF8F5] border border-cream-divider rounded-lg p-0.5">
+                          <span className="text-[10px] font-semibold text-warm-accent pl-1 pr-0.5 uppercase tracking-wider flex items-center gap-0.5">
+                            <span className="material-symbols-outlined text-[13px] leading-none">table_rows</span>
+                          </span>
+                          <button
+                            type="button"
+                            title={t('add_row')}
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => addTableRow(index)}
+                            className="w-5 h-5 flex items-center justify-center rounded text-warm-muted hover:text-warm-accent active:scale-90 transition-transform"
+                          >
+                            <span className="material-symbols-outlined text-[13px] leading-none">add</span>
+                          </button>
+                          <button
+                            type="button"
+                            title={t('del_row')}
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => removeTableRow(index, activeTableCell?.rowIndex)}
+                            disabled={block.cells.length <= 1}
+                            className="w-5 h-5 flex items-center justify-center rounded text-warm-muted hover:text-red-600 disabled:opacity-20 active:scale-90 transition-transform"
+                          >
+                            <span className="material-symbols-outlined text-[13px] leading-none">remove</span>
+                          </button>
+                        </div>
                       </div>
                     </div>
                   </div>
                 )}
 
                 {block.type === 'code' && (
-                  <div className="bg-cream-surface/70 rounded p-2 my-1 font-code">
+                  <div className="bg-cream-surface/70 rounded-xl p-2.5 my-1.5 font-code border border-cream-divider/60 flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between border-b border-cream-divider/40 pb-1">
+                      <span className="text-[10px] font-mono font-semibold uppercase text-warm-accent">Code Block</span>
+                      <input
+                        type="text"
+                        value={block.language || ''}
+                        placeholder="lang (e.g. python, js, html)"
+                        onFocus={() => setFocusedBlockIndex(index)}
+                        onChange={(e) => updateBlock(index, { ...block, language: e.target.value.toLowerCase().trim() })}
+                        className="text-[10px] font-mono text-warm-muted bg-transparent border-none focus:outline-none text-right placeholder:text-warm-subtle w-32"
+                      />
+                    </div>
                     <textarea
                       rows={1}
                       value={block.text}
@@ -1507,34 +2854,247 @@ export const EditorView: React.FC<EditorViewProps> = ({
                 )}
 
                 {block.type === 'details' && (
-                  <div className="border-l border-cream-divider pl-3 my-1 flex flex-col gap-1">
-                    <input
-                      type="text"
-                      value={block.summary}
-                      placeholder={t('details_summary_placeholder')}
-                      onFocus={() => setFocusedBlockIndex(index)}
-                      onChange={(e) => updateBlock(index, { ...block, summary: e.target.value })}
-                      className="text-xs font-semibold text-warm-accent bg-transparent border-none focus:outline-none"
+                  <div className="w-full my-2 rounded-xl border border-cream-divider/80 bg-cream-surface/40 overflow-hidden transition-all">
+                    <div
+                      onClick={() => toggleDetails(block.id)}
+                      className="flex items-center justify-between px-3 py-2 bg-cream-surface/60 cursor-pointer select-none"
+                    >
+                      <input
+                        type="text"
+                        value={block.summary}
+                        placeholder={t('details_summary_placeholder')}
+                        onClick={(e) => e.stopPropagation()}
+                        onFocus={() => setFocusedBlockIndex(index)}
+                        onChange={(e) => updateBlock(index, { ...block, summary: e.target.value })}
+                        className="flex-1 text-xs font-semibold text-warm-text bg-transparent border-none focus:outline-none pr-2"
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleDetails(block.id);
+                        }}
+                        className="w-5 h-5 flex items-center justify-center text-warm-muted transition-transform duration-200"
+                        style={{
+                          transform: openDetailsMap[block.id] !== false ? 'rotate(180deg)' : 'rotate(0deg)',
+                        }}
+                      >
+                        <span className="material-symbols-outlined text-[16px]">expand_more</span>
+                      </button>
+                    </div>
+                    <div
+                      className={`grid transition-[grid-template-rows,opacity] duration-200 ease-out ${
+                        openDetailsMap[block.id] !== false
+                          ? 'grid-rows-[1fr] opacity-100'
+                          : 'grid-rows-[0fr] opacity-0 pointer-events-none'
+                      }`}
+                    >
+                      <div className="overflow-hidden">
+                        <div className="p-3 border-t border-cream-divider/60">
+                          <textarea
+                            rows={1}
+                            value={block.text}
+                            placeholder={t('details_content_placeholder')}
+                            ref={(el) => {
+                              if (el) autoResize(el);
+                            }}
+                            onFocus={() => setFocusedBlockIndex(index)}
+                            onInput={(e) => autoResize(e.currentTarget)}
+                            onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
+                            className="w-full text-xs leading-relaxed text-warm-text bg-transparent border-none focus:outline-none resize-none overflow-hidden"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {block.type === 'divider' && (
+                  <div
+                    tabIndex={0}
+                    onClick={() => {
+                      triggerHaptic('light');
+                      setFocusedBlockIndex(index);
+                    }}
+                    onFocus={() => setFocusedBlockIndex(index)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Backspace' || e.key === 'Delete') {
+                        e.preventDefault();
+                        removeBlock(index);
+                      }
+                    }}
+                    className="w-full py-3 cursor-pointer group/divider flex items-center focus:outline-none"
+                  >
+                    <div
+                      className={`w-full h-[1.5px] transition-all duration-150 ${
+                        focusedBlockIndex === index
+                          ? 'bg-warm-accent shadow-xs'
+                          : 'bg-cream-divider group-hover/divider:bg-warm-subtle'
+                      }`}
                     />
+                  </div>
+                )}
+                {block.type === 'footer' && (
+                  <div className="w-full my-2 flex flex-col gap-1 transition-all">
+                    <div className="flex items-center justify-between pb-0.5">
+                      <span className="text-[10px] font-semibold uppercase tracking-wider text-warm-subtle flex items-center gap-1">
+                        <span className="material-symbols-outlined text-[13px]">short_text</span>
+                        <span>{t('tool_footer')}</span>
+                      </span>
+                    </div>
                     <textarea
                       rows={1}
                       value={block.text}
-                      placeholder={t('details_content_placeholder')}
+                      placeholder={t('footer_placeholder')}
                       ref={(el) => {
                         if (el) autoResize(el);
                       }}
                       onFocus={() => setFocusedBlockIndex(index)}
                       onInput={(e) => autoResize(e.currentTarget)}
                       onChange={(e) => updateBlock(index, { ...block, text: e.target.value })}
-                      className="text-xs text-warm-text bg-transparent border-none focus:outline-none resize-none overflow-hidden"
+                      className="w-full text-xs font-normal text-warm-muted leading-relaxed bg-transparent border-none focus:outline-none resize-none overflow-hidden placeholder:text-warm-subtle"
                     />
                   </div>
                 )}
+                {block.type === 'button_row' && (
+                  <div
+                    onClick={() => setFocusedBlockIndex(index)}
+                    className="flex flex-col gap-1.5 my-2 w-full min-w-0 transition-all select-none"
+                  >
+                    <div
+                      className={`flex items-center justify-between gap-2 overflow-hidden transition-all duration-200 ease-out ${
+                        focusedBlockIndex === index
+                          ? 'max-h-10 opacity-100 py-1'
+                          : 'max-h-0 opacity-0 pointer-events-none py-0'
+                      }`}
+                    >
+                      <div className="flex items-center bg-cream-surface border border-cream-divider rounded-lg p-0.5">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setButtonRowAlign(index, 'left');
+                          }}
+                          className={`w-6 h-6 flex items-center justify-center rounded transition-colors ${
+                            block.align === 'left' ? 'text-warm-accent bg-[#FAF8F5] shadow-xs' : 'text-warm-muted hover:text-warm-text'
+                          }`}
+                        >
+                          <span className="material-symbols-outlined text-[14px]">format_align_left</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setButtonRowAlign(index, 'center');
+                          }}
+                          className={`w-6 h-6 flex items-center justify-center rounded transition-colors ${
+                            block.align === 'center' ? 'text-warm-accent bg-[#FAF8F5] shadow-xs' : 'text-warm-muted hover:text-warm-text'
+                          }`}
+                        >
+                          <span className="material-symbols-outlined text-[14px]">format_align_center</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setButtonRowAlign(index, 'right');
+                          }}
+                          className={`w-6 h-6 flex items-center justify-center rounded transition-colors ${
+                            block.align === 'right' ? 'text-warm-accent bg-[#FAF8F5] shadow-xs' : 'text-warm-muted hover:text-warm-text'
+                          }`}
+                        >
+                          <span className="material-symbols-outlined text-[14px]">format_align_right</span>
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          addButtonToRow(index);
+                        }}
+                        disabled={block.buttons.length >= 3}
+                        className="px-2.5 py-1 rounded-full bg-cream-surface border border-cream-divider text-[11px] font-semibold text-warm-accent disabled:opacity-30 flex items-center gap-1 active:scale-95 transition-transform"
+                      >
+                        <span className="material-symbols-outlined text-[13px]">add</span>
+                        <span>{t('btn_add_to_row')}</span>
+                      </button>
+                    </div>
+                    <div
+                      className={`flex items-center gap-2 py-2 w-full ${
+                        block.buttons.length === 1
+                          ? block.align === 'center'
+                            ? 'justify-center'
+                            : block.align === 'right'
+                            ? 'justify-end'
+                            : 'justify-start'
+                          : 'justify-between'
+                      }`}
+                    >
+                      {block.buttons.map((btn, btnIdx) => {
+                        const styleClass =
+                          btn.style === 'primary'
+                            ? 'bg-[#2AABEE] text-white border-transparent'
+                            : btn.style === 'success'
+                            ? 'bg-[#3E7356] text-white border-transparent'
+                            : btn.style === 'danger'
+                            ? 'bg-[#BA4A38] text-white border-transparent'
+                            : 'bg-[#FAF8F5] text-warm-text border-cream-divider';
 
-                {block.type === 'divider' && <div className="w-full h-px bg-cream-divider my-2" />}
-              </div>
+                        const isThisDragging = activeDraggingBtnId === btn.id;
+                        const isRowJiggling = activeJiggleRowIndex === index;
 
-              {focusedBlockIndex === index && (
+                        const jiggleClass =
+                          isRowJiggling && !isThisDragging
+                            ? btnIdx % 2 === 0
+                              ? 'animate-jiggle-a'
+                              : 'animate-jiggle-b'
+                            : '';
+
+                        const dynamicTransform = isThisDragging
+                          ? `translate3d(${dragOffsetX}px, -2px, 0) scale(1.04)`
+                          : 'translate3d(0, 0, 0) scale(1)';
+
+                        const widthClass =
+                          block.buttons.length === 1
+                            ? 'flex-initial max-w-[85%] px-4'
+                            : 'flex-1 min-w-0 px-2.5';
+
+                        return (
+                          <button
+                            key={btn.id}
+                            type="button"
+                            onTouchStart={(e) => handleBtnTouchStart(index, btnIdx, btn.id, e)}
+                            onTouchMove={(e) => handleBtnTouchMove(index, e)}
+                            onTouchEnd={handleBtnTouchEnd}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (!buttonDragRef.current?.isDragging) {
+                                handleOpenButtonConfig(index, btnIdx, btn);
+                              }
+                            }}
+                            style={{
+                              transform: dynamicTransform,
+                              transition: isThisDragging ? 'none' : 'transform 0.2s cubic-bezier(0.2, 0.9, 0.3, 1)',
+                            }}
+                            className={`py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 border cursor-pointer touch-none select-none relative ${widthClass} ${styleClass} ${jiggleClass} ${
+                              isThisDragging
+                                ? 'z-30 border-warm-accent ring-1 ring-warm-accent'
+                                : 'active:opacity-80'
+                            }`}
+                          >
+                            <span className="material-symbols-outlined text-[14px] leading-none opacity-85 shrink-0 pointer-events-none">
+                              {btn.type === 'copy_text' ? 'content_copy' : 'link'}
+                            </span>
+                            <span className="truncate block min-w-0 pointer-events-none">{btn.text}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+                  </div>
+
+              {(focusedBlockIndex === index || block.type === 'button_row') && (
                 <div className="absolute right-0 -top-3 z-10 flex items-center gap-1 bg-[#FAF8F5] border border-cream-divider/80 px-1.5 py-0.5 rounded-full shadow-sm animate-page-fade">
                   <button
                     onMouseDown={(e) => e.preventDefault()}
@@ -1569,7 +3129,9 @@ export const EditorView: React.FC<EditorViewProps> = ({
         </div>
       </div>
 
-      {isEditorActive &&
+      
+
+      {isEditorActive && !showExportModal && !editingButtonModal && !timePickerModal.isOpen &&
         createPortal(
           <div
             data-format-bar="true"
@@ -1650,6 +3212,17 @@ export const EditorView: React.FC<EditorViewProps> = ({
                   visibility_off
                 </span>
               </button>
+              <button
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  openTimePicker();
+                }}
+                className="flex items-center justify-center w-8 h-8 rounded-full transition-colors text-warm-muted hover:text-warm-text active:bg-cream-divider"
+              >
+                <span className="material-symbols-outlined text-[16px] leading-none">
+                  schedule
+                </span>
+              </button>
               <div className="w-[1px] h-4 bg-cream-divider mx-1" />
               <button
                 onPointerDown={(e) => e.preventDefault()}
@@ -1660,6 +3233,358 @@ export const EditorView: React.FC<EditorViewProps> = ({
                   format_clear
                 </span>
               </button>
+            </div>
+          </div>,
+          document.body
+        )}
+      {showExportModal &&
+        createPortal(
+          <div
+            onClick={() => {
+              if (!isExporting) setShowExportModal(false);
+            }}
+            className="fixed inset-0 z-50 flex flex-col justify-end bg-[#24201D]/45 transition-opacity duration-150"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-[420px] mx-auto bg-[#FAF8F5] rounded-t-3xl border-t border-cream-divider px-6 pt-3 flex flex-col gap-3 animate-sheet-up"
+              style={{
+                paddingBottom: 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 18px)',
+              }}
+            >
+              <div className="w-10 h-1 rounded-full bg-cream-divider self-center shrink-0 mb-1" />
+
+              <div className="flex items-center justify-between pb-1">
+                <span className="text-xs font-semibold uppercase tracking-wider text-warm-text">
+                  {t('export_modal_title')}
+                </span>
+                <button
+                  type="button"
+                  disabled={isExporting}
+                  onClick={() => setShowExportModal(false)}
+                  className="w-6 h-6 flex items-center justify-center rounded-full text-warm-muted hover:text-warm-text disabled:opacity-30"
+                >
+                  <span className="material-symbols-outlined text-[16px]">close</span>
+                </button>
+              </div>
+
+              <div className="flex flex-col gap-1 max-h-[38vh] overflow-y-auto no-scrollbar">
+                <label className="flex items-center justify-between py-2 px-2.5 rounded-xl bg-cream-surface/50 border border-cream-divider/50 cursor-pointer select-none">
+                  <div className="flex items-center gap-2">
+                    <span className="material-symbols-outlined text-[16px] text-warm-accent">send</span>
+                    <span className="text-xs font-medium text-warm-text">{t('export_private_chat')}</span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    disabled={isExporting}
+                    checked={sendToUserChat}
+                    onChange={(e) => setSendToUserChat(e.target.checked)}
+                    className="w-4 h-4 accent-warm-accent rounded"
+                  />
+                </label>
+
+                <div className="pt-2 pb-1">
+                  <span className="text-[10px] font-semibold text-warm-muted uppercase tracking-wider">
+                    {t('export_select_channels')}
+                  </span>
+                </div>
+
+                {(!channels || channels.length === 0) ? (
+                  <div className="p-3 text-center text-[11px] text-warm-subtle italic bg-cream-surface/30 rounded-xl">
+                    {t('no_channels_hint')}
+                  </div>
+                ) : (
+                  channels.map((ch) => {
+                    const isChecked = selectedExportChannels.includes(ch.id);
+                    return (
+                      <label
+                        key={ch.id}
+                        className={`flex items-center justify-between py-2 px-2.5 rounded-xl border transition-colors cursor-pointer select-none ${
+                          isChecked
+                            ? 'bg-cream-surface border-warm-accent/40'
+                            : 'bg-transparent border-cream-divider/40'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0 pr-2">
+                          <span className="material-symbols-outlined text-[16px] text-warm-accent">tag</span>
+                          <span className="text-xs font-medium text-warm-text truncate">{ch.title}</span>
+                        </div>
+                        <input
+                          type="checkbox"
+                          disabled={isExporting}
+                          checked={isChecked}
+                          onChange={() => toggleChannelSelection(ch.id)}
+                          className="w-4 h-4 accent-warm-accent rounded shrink-0"
+                        />
+                      </label>
+                    );
+                  })
+                )}
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-cream-divider/50">
+                <button
+                  type="button"
+                  disabled={isExporting}
+                  onClick={() => setShowExportModal(false)}
+                  className="px-3.5 py-1.5 rounded-full text-xs font-medium text-warm-muted bg-cream-surface active:scale-95 transition-transform disabled:opacity-30"
+                >
+                  {t('deselect_all')}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExport}
+                  disabled={isExporting || (!sendToUserChat && selectedExportChannels.length === 0)}
+                  className="px-4 py-1.5 rounded-full text-xs font-semibold text-[#FAF8F5] bg-warm-accent active:scale-95 transition-all disabled:opacity-30 flex items-center gap-1.5"
+                >
+                  {isExporting ? (
+                    <>
+                      <div className="w-3 h-3 rounded-full border-[1.5px] border-white/20 border-t-white animate-spin" />
+                      <span>{t('exporting')}</span>
+                    </>
+                  ) : (
+                    <span>{selectedExportChannels.length > 0 ? t('export_with_ad') : t('export_rich')}</span>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+      {editingButtonModal &&
+        createPortal(
+          <div
+            data-modal="true"
+            onClick={() => setEditingButtonModal(null)}
+            className="fixed inset-0 z-50 flex flex-col justify-end bg-[#24201D]/45 transition-opacity duration-150"
+          >
+            <div
+              data-modal="true"
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-[420px] mx-auto bg-[#FAF8F5] rounded-t-3xl border-t border-cream-divider px-6 pt-3 pb-6 flex flex-col gap-3.5 shadow-xl animate-sheet-up"
+              style={{
+                paddingBottom: 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 18px)',
+              }}
+            >
+              <div className="w-10 h-1 rounded-full bg-cream-divider self-center shrink-0 mb-1" />
+              <div className="flex items-center justify-between pb-1 border-b border-cream-divider/50">
+                <span className="text-xs font-semibold uppercase tracking-wider text-warm-text">
+                  {t('btn_edit_title')}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setEditingButtonModal(null)}
+                  className="w-6 h-6 flex items-center justify-center rounded-full text-warm-muted hover:text-warm-text"
+                >
+                  <span className="material-symbols-outlined text-[16px]">close</span>
+                </button>
+              </div>
+              <div className="flex flex-col gap-2.5">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] font-semibold uppercase text-warm-muted">
+                    {t('btn_text_label')}
+                  </label>
+                  <input
+                    type="text"
+                    value={editingButtonModal.text}
+                    placeholder={t('btn_text_placeholder')}
+                    onChange={(e) =>
+                      setEditingButtonModal({ ...editingButtonModal, text: e.target.value })
+                    }
+                    className="w-full bg-cream-surface rounded-xl px-3 py-2 text-xs text-warm-text border-none focus:outline-none"
+                  />
+                </div>
+                <div className="flex items-center bg-cream-surface p-1 rounded-xl gap-1">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setEditingButtonModal({ ...editingButtonModal, type: 'url' })
+                    }
+                    className={`flex-1 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                      editingButtonModal.type === 'url'
+                        ? 'bg-[#FAF8F5] text-warm-accent shadow-xs'
+                        : 'text-warm-muted'
+                    }`}
+                  >
+                    {t('btn_type_url')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setEditingButtonModal({ ...editingButtonModal, type: 'copy_text' })
+                    }
+                    className={`flex-1 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                      editingButtonModal.type === 'copy_text'
+                        ? 'bg-[#FAF8F5] text-warm-accent shadow-xs'
+                        : 'text-warm-muted'
+                    }`}
+                  >
+                    {t('btn_type_copy')}
+                  </button>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] font-semibold uppercase text-warm-muted">
+                    {editingButtonModal.type === 'url' ? 'URL Link' : 'Copy Value'}
+                  </label>
+                  <input
+                    type="text"
+                    value={editingButtonModal.value}
+                    placeholder={
+                      editingButtonModal.type === 'url'
+                        ? t('btn_url_placeholder')
+                        : t('btn_copy_placeholder')
+                    }
+                    onChange={(e) =>
+                      setEditingButtonModal({ ...editingButtonModal, value: e.target.value })
+                    }
+                    className="w-full bg-cream-surface rounded-xl px-3 py-2 text-xs text-warm-text border-none focus:outline-none"
+                  />
+                </div>
+                <div className="flex flex-col gap-1 pt-1">
+                  <label className="text-[10px] font-semibold uppercase text-warm-muted">Color Theme</label>
+                  <div className="grid grid-cols-4 gap-2">
+                    {(['default', 'primary', 'success', 'danger'] as const).map((clr) => {
+                      const isActive = editingButtonModal.style === clr;
+                      const label = t(`btn_style_${clr}` as any);
+                      const bgClass =
+                        clr === 'primary'
+                          ? 'bg-[#2AABEE]'
+                          : clr === 'success'
+                          ? 'bg-[#3E7356]'
+                          : clr === 'danger'
+                          ? 'bg-[#BA4A38]'
+                          : 'bg-[#EAE4DC]';
+                      return (
+                        <button
+                          key={clr}
+                          type="button"
+                          onClick={() =>
+                            setEditingButtonModal({ ...editingButtonModal, style: clr })
+                          }
+                          className={`flex flex-col items-center gap-1 p-2 rounded-xl border transition-all ${
+                            isActive ? 'border-warm-accent bg-warm-accent-light' : 'border-transparent bg-cream-surface'
+                          }`}
+                        >
+                          <div className={`w-4 h-4 rounded-full ${bgClass}`} />
+                          <span className="text-[10px] font-medium text-warm-text">{label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2 pt-2 border-t border-cream-divider/50">
+                <button
+                  type="button"
+                  onClick={() =>
+                    deleteButtonFromRow(
+                      editingButtonModal.blockIndex,
+                      editingButtonModal.buttonIndex
+                    )
+                  }
+                  className="px-3 py-1.5 rounded-full text-xs font-semibold text-red-600 bg-red-50 active:scale-95 transition-transform"
+                >
+                  {t('btn_delete')}
+                </button>
+                <button
+                  type="button"
+                  onClick={saveEditedButton}
+                  className="px-5 py-1.5 rounded-full text-xs font-semibold text-[#FAF8F5] bg-warm-accent active:scale-95 transition-transform"
+                >
+                  {t('btn_save')}
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+      {timePickerModal.isOpen &&
+        createPortal(
+          <div
+            data-modal="true"
+            onClick={() => setTimePickerModal((prev) => ({ ...prev, isOpen: false }))}
+            className="fixed inset-0 z-50 flex flex-col justify-end bg-[#24201D]/45 transition-opacity duration-150"
+          >
+            <div
+              data-modal="true"
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-[420px] mx-auto bg-[#FAF8F5] rounded-t-3xl border-t border-cream-divider px-6 pt-3 pb-6 flex flex-col gap-3.5 shadow-xl animate-sheet-up"
+              style={{
+                paddingBottom: 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 18px)',
+              }}
+            >
+              <div className="w-10 h-1 rounded-full bg-cream-divider self-center shrink-0 mb-1" />
+              <div className="flex items-center justify-between pb-1 border-b border-cream-divider/50">
+                <span className="text-xs font-semibold uppercase tracking-wider text-warm-text">
+                  {t('time_modal_title')}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setTimePickerModal((prev) => ({ ...prev, isOpen: false }))}
+                  className="w-6 h-6 flex items-center justify-center rounded-full text-warm-muted hover:text-warm-text"
+                >
+                  <span className="material-symbols-outlined text-[16px]">close</span>
+                </button>
+              </div>
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] font-semibold uppercase text-warm-muted">
+                    {t('time_label_datetime')}
+                  </label>
+                  <input
+                    type="datetime-local"
+                    value={timePickerModal.datetimeVal}
+                    onChange={(e) =>
+                      setTimePickerModal((prev) => ({ ...prev, datetimeVal: e.target.value }))
+                    }
+                    className="w-full bg-cream-surface rounded-xl px-3 py-2 text-xs text-warm-text border-none focus:outline-none font-mono"
+                  />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] font-semibold uppercase text-warm-muted">
+                    {t('time_label_format')}
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {[
+                      { id: 'wDT', labelKey: 'time_format_wdt' },
+                      { id: 'full', labelKey: 'time_format_full' },
+                      { id: 'time', labelKey: 'time_format_time_only' },
+                      { id: 'rel', labelKey: 'time_format_rel' },
+                    ].map((fmt) => (
+                      <button
+                        key={fmt.id}
+                        type="button"
+                        onClick={() =>
+                          setTimePickerModal((prev) => ({ ...prev, format: fmt.id as any }))
+                        }
+                        className={`py-2 px-2 rounded-xl text-left text-[11px] font-medium border transition-colors flex flex-col gap-0.5 ${
+                          timePickerModal.format === fmt.id
+                            ? 'bg-warm-accent-light border-warm-accent text-warm-accent'
+                            : 'bg-cream-surface border-transparent text-warm-text'
+                        }`}
+                      >
+                        <span className="font-semibold">{t(fmt.labelKey as any)}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-cream-divider/50">
+                <button
+                  type="button"
+                  onClick={() => setTimePickerModal((prev) => ({ ...prev, isOpen: false }))}
+                  className="px-3.5 py-1.5 rounded-full text-xs font-semibold text-warm-muted bg-cream-surface active:scale-95 transition-transform"
+                >
+                  {t('deselect_all')}
+                </button>
+                <button
+                  type="button"
+                  onClick={insertDynamicTime}
+                  className="px-5 py-1.5 rounded-full text-xs font-semibold text-[#FAF8F5] bg-warm-accent active:scale-95 transition-transform"
+                >
+                  {t('time_insert')}
+                </button>
+              </div>
             </div>
           </div>,
           document.body

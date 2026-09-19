@@ -3,9 +3,11 @@ import { HomeView } from './components/HomeView';
 import { NotebooksView } from './components/NotebooksView';
 import { FavoritesView } from './components/FavoritesView';
 import { EditorView } from './components/EditorView';
-import { NoteItem, TopicItem } from './types';
-import { fetchBootstrap, syncNotesBatch, deleteNoteApi, deleteNotesBatchApi, createTopicApi, deleteTopicApi } from './services/api';
+import { ChannelsView } from './components/ChannelsView';
+import { NoteItem, TopicItem, ChannelItem } from './types';
+import { fetchBootstrap, syncNotesBatch, deleteNoteApi, deleteNotesBatchApi, createTopicApi, deleteTopicApi, fetchChannels } from './services/api';
 import { setLanguage, t, subscribeLanguage } from './services/i18n';
+import { deleteFromImgbb } from './services/imgbb';
 
 let isTelegramBound = false;
 
@@ -26,9 +28,29 @@ const getStorageKey = (prefix: string): string => {
 };
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'notes' | 'notebooks' | 'favorites'>('notes');
+  const [activeTab, setActiveTab] = useState<'notes' | 'notebooks' | 'favorites' | 'channels'>('notes');
   const [activeView, setActiveView] = useState<'list' | 'editor'>('list');
   const [activeNote, setActiveNote] = useState<NoteItem | null>(null);
+  const [channels, setChannels] = useState<ChannelItem[]>([]);
+  const [botUsername, setBotUsername] = useState<string>('');
+
+  const isFetchingChannelsRef = useRef<boolean>(false);
+  const refreshChannels = useCallback(async () => {
+    if (isFetchingChannelsRef.current) return channels;
+    isFetchingChannelsRef.current = true;
+    try {
+      const res = await fetchChannels();
+      if (res.channels) setChannels(res.channels);
+      if (res.bot_username) setBotUsername(res.bot_username);
+      return res.channels || [];
+    } finally {
+      isFetchingChannelsRef.current = false;
+    }
+  }, [channels]);
+
+  useEffect(() => {
+    refreshChannels();
+  }, [refreshChannels]);
   const [, setCurrentLang] = useState<string>(() => localStorage.getItem('notigram_lang') || 'en');
 
   useEffect(() => {
@@ -192,11 +214,17 @@ export const App: React.FC = () => {
   };
 
   const handleSaveNote = (updated: NoteItem) => {
-    const exists = notes.some((n) => n.id === updated.id);
-    const nextNotes = exists ? notes.map((n) => (n.id === updated.id ? updated : n)) : [updated, ...notes];
+    const resolvedPinned = updated.is_favorite !== undefined ? updated.is_favorite : updated.is_pinned;
+    const normalizedNote: NoteItem = {
+      ...updated,
+      is_pinned: resolvedPinned,
+      is_favorite: resolvedPinned,
+    };
+    const exists = notes.some((n) => n.id === normalizedNote.id);
+    const nextNotes = exists ? notes.map((n) => (n.id === normalizedNote.id ? normalizedNote : n)) : [normalizedNote, ...notes];
     setNotes(nextNotes);
     localStorage.setItem(getStorageKey('notigram_user_notes'), JSON.stringify(nextNotes));
-    pendingNotesRef.current.set(updated.id, updated);
+    pendingNotesRef.current.set(normalizedNote.id, normalizedNote);
     if (debounceTimerRef.current) {
       clearTimeout(debounceTimerRef.current);
     }
@@ -206,6 +234,18 @@ export const App: React.FC = () => {
   };
 
   const handleDeleteNote = (id: string) => {
+    const target = notes.find((n) => n.id === id);
+    if (target) {
+      target.blocks.forEach((b) => {
+        if (b.type === 'media' && 'images' in b && Array.isArray(b.images)) {
+          b.images.forEach((img: any) => {
+            if (img?.delete_url) {
+              deleteFromImgbb(img.delete_url);
+            }
+          });
+        }
+      });
+    }
     pendingNotesRef.current.delete(id);
     const nextNotes = notes.filter((n) => n.id !== id);
     setNotes(nextNotes);
@@ -218,6 +258,18 @@ export const App: React.FC = () => {
   };
 
   const handleBatchDeleteNotes = (ids: string[]) => {
+    const targets = notes.filter((n) => ids.includes(n.id));
+    targets.forEach((target) => {
+      target.blocks.forEach((b) => {
+        if (b.type === 'media' && 'images' in b && Array.isArray(b.images)) {
+          b.images.forEach((img: any) => {
+            if (img?.delete_url) {
+              deleteFromImgbb(img.delete_url);
+            }
+          });
+        }
+      });
+    });
     ids.forEach((id) => pendingNotesRef.current.delete(id));
     const nextNotes = notes.filter((n) => !ids.includes(n.id));
     setNotes(nextNotes);
@@ -227,7 +279,13 @@ export const App: React.FC = () => {
 
   const handleToggleFavorite = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    const nextNotes = notes.map((n) => (n.id === id ? { ...n, is_favorite: !n.is_favorite } : n));
+    const nextNotes = notes.map((n) => {
+      if (n.id === id) {
+        const nextFav = !n.is_favorite;
+        return { ...n, is_favorite: nextFav, is_pinned: nextFav };
+      }
+      return n;
+    });
     setNotes(nextNotes);
     localStorage.setItem(getStorageKey('notigram_user_notes'), JSON.stringify(nextNotes));
     const target = nextNotes.find((n) => n.id === id);
@@ -260,13 +318,37 @@ export const App: React.FC = () => {
       {activeView === 'list' && (
         <header className="safe-header-box bg-[#FAF8F5] border-b border-cream-divider/60 max-w-[420px] w-full mx-auto shrink-0 z-20">
           <div className="px-6 pb-2 flex items-center justify-between">
-            <h1 className="text-sm font-semibold tracking-tight text-warm-text">
-              {activeTab === 'notes'
-                ? t('notes_title')
-                : activeTab === 'notebooks'
-                ? t('notebooks_title')
-                : t('favorites_title')}
-            </h1>
+            {activeTab === 'notes' || activeTab === 'channels' ? (
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => {
+                    triggerHaptic('light');
+                    setActiveTab('notes');
+                  }}
+                  className={`text-sm tracking-tight transition-colors ${
+                    activeTab === 'notes' ? 'font-semibold text-warm-text' : 'font-normal text-warm-muted hover:text-warm-text'
+                  }`}
+                >
+                  {t('notes_title')}
+                </button>
+                <span className="text-xs text-cream-divider">/</span>
+                <button
+                  onClick={() => {
+                    triggerHaptic('light');
+                    setActiveTab('channels');
+                  }}
+                  className={`text-sm tracking-tight transition-colors ${
+                    activeTab === 'channels' ? 'font-semibold text-warm-text' : 'font-normal text-warm-muted hover:text-warm-text'
+                  }`}
+                >
+                  {t('my_channel')}
+                </button>
+              </div>
+            ) : (
+              <h1 className="text-sm font-semibold tracking-tight text-warm-text">
+                {activeTab === 'notebooks' ? t('notebooks_title') : t('favorites_title')}
+              </h1>
+            )}
             <div className="w-7 h-7 rounded-full bg-cream-surface text-warm-text font-semibold text-xs flex items-center justify-center border border-cream-divider overflow-hidden">
               {userPhoto ? (
                 <img src={userPhoto} alt={userName} className="w-full h-full object-cover" />
@@ -282,6 +364,7 @@ export const App: React.FC = () => {
           <EditorView
             note={activeNote}
             topics={topics}
+            channels={channels}
             onBack={() => {
               flushPendingSync();
               triggerHaptic();
@@ -301,6 +384,7 @@ export const App: React.FC = () => {
                 onToggleFavorite={handleToggleFavorite}
                 onDeleteNote={handleDeleteNote}
                 onBatchDeleteNotes={handleBatchDeleteNotes}
+                onOpenChannels={() => setActiveTab('channels')}
               />
             )}
             {activeTab === 'notebooks' && (
@@ -318,6 +402,15 @@ export const App: React.FC = () => {
                 topics={topics}
                 onOpenNote={handleOpenNote}
                 onToggleFavorite={handleToggleFavorite}
+              />
+            )}
+            {activeTab === 'channels' && (
+              <ChannelsView
+                channels={channels}
+                botUsername={botUsername}
+                onRefresh={refreshChannels}
+                onChannelsUpdated={setChannels}
+                onBack={() => setActiveTab('notes')}
               />
             )}
           </>

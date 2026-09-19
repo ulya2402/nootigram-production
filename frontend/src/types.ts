@@ -16,6 +16,27 @@ export interface TopicItem {
   is_default?: boolean;
 }
 
+export interface MediaImageItem {
+  id: string;
+  url: string;
+  delete_url?: string;
+}
+
+export interface ChannelItem {
+  id: string;
+  title: string;
+  username?: string;
+  photo_url?: string;
+}
+
+declare global {
+  interface Window {
+    Telegram?: {
+      WebApp: TelegramWebApp;
+    };
+  }
+}
+
 export type ContentBlock =
   | { id: string; type: 'paragraph'; text: string }
   | { id: string; type: 'heading'; size: 1 | 2 | 3 | 4 | 5 | 6; text: string }
@@ -35,7 +56,47 @@ export type ContentBlock =
   | { id: string; type: 'code'; text: string; language?: string }
   | { id: string; type: 'math'; expression: string }
   | { id: string; type: 'details'; summary: string; text: string }
-  | { id: string; type: 'divider' };
+  | { id: string; type: 'divider' }
+  | {
+      id: string;
+      type: 'media';
+      layout: 'single' | 'collage' | 'slideshow';
+      images: MediaImageItem[];
+      caption?: string;
+    }
+  | {
+      id: string;
+      type: 'audio';
+      url: string;
+      name: string;
+      size?: number;
+      caption?: string;
+    }
+  | {
+      id: string;
+      type: 'file';
+      url: string;
+      name: string;
+      size?: number;
+      caption?: string;
+    }
+  | {
+      id: string;
+      type: 'button_row';
+      align: 'left' | 'center' | 'right';
+      buttons: {
+        id: string;
+        text: string;
+        style: 'default' | 'primary' | 'success' | 'danger';
+        type: 'url' | 'copy_text';
+        value: string;
+      }[];
+    }
+  | {
+      id: string;
+      type: 'footer';
+      text: string;
+    };
 
 export interface NoteItem {
   id: string;
@@ -70,6 +131,7 @@ export interface TelegramWebApp {
   onEvent: (eventType: string, eventHandler: () => void) => void;
   offEvent: (eventType: string, eventHandler: () => void) => void;
   openTelegramLink: (url: string) => void;
+  openLink?: (url: string, options?: { try_instant_view?: boolean }) => void;
   requestWriteAccess: (callback?: (allowed: boolean) => void) => void;
   BackButton: {
     isVisible: boolean;

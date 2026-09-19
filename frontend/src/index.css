@@ -51,6 +51,22 @@ code {
   font-size: 0.9em;
 }
 
+tg-time {
+  background-color: rgba(138, 81, 34, 0.1);
+  color: #8A5122;
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-size: 0.88em;
+  font-family: inherit;
+  font-weight: 600;
+  border-bottom: 1px dashed rgba(138, 81, 34, 0.4);
+  cursor: pointer;
+  user-select: text;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
 @keyframes pageFadeIn {
   from {
     opacity: 0;
@@ -141,6 +157,46 @@ code {
 
 .animate-spin-fast {
   animation: spinLoader 0.75s linear infinite;
+}
+
+@keyframes sheetSlideUp {
+  from {
+    transform: translate3d(0, 100%, 0);
+    opacity: 0.9;
+  }
+  to {
+    transform: translate3d(0, 0, 0);
+    opacity: 1;
+  }
+}
+
+.animate-sheet-up {
+  animation: sheetSlideUp 0.28s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  will-change: transform;
+}
+
+@keyframes btnJiggleA {
+  0% { transform: rotate(0deg); }
+  25% { transform: rotate(-1.4deg) translate3d(-0.5px, 0, 0); }
+  75% { transform: rotate(1.4deg) translate3d(0.5px, 0, 0); }
+  100% { transform: rotate(0deg); }
+}
+
+@keyframes btnJiggleB {
+  0% { transform: rotate(0deg); }
+  25% { transform: rotate(1.4deg) translate3d(0.5px, 0, 0); }
+  75% { transform: rotate(-1.4deg) translate3d(-0.5px, 0, 0); }
+  100% { transform: rotate(0deg); }
+}
+
+.animate-jiggle-a {
+  animation: btnJiggleA 0.18s ease-in-out infinite alternate;
+  will-change: transform;
+}
+
+.animate-jiggle-b {
+  animation: btnJiggleB 0.21s ease-in-out infinite alternate;
+  will-change: transform;
 }
 
 textarea {

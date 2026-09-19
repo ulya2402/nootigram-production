@@ -3,6 +3,7 @@ export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   WEBAPP_URL: string;
   ENVIRONMENT?: string;
+  IMGBB_API_KEYS?: string;
 }
 
 export type InputRichBlock =
@@ -22,11 +23,42 @@ export type InputRichBlock =
       is_compact?: boolean;
       caption?: string;
     }
-  | { 
-      type: 'list'; 
-      items: { label?: string; blocks: InputRichBlock[]; has_checkbox?: boolean; is_checked?: boolean }[] 
-    }
-  | { type: 'details'; summary: string; blocks: InputRichBlock[]; is_open?: boolean };
+  | {
+       type: 'list';
+       items: { label?: string; blocks: InputRichBlock[]; has_checkbox?: boolean; is_checked?: boolean }[];
+     }
+  | { type: 'details'; summary: string; blocks: InputRichBlock[]; is_open?: boolean }
+  | {
+       type: 'media';
+       layout?: 'single' | 'collage' | 'slideshow';
+       images: string[];
+       caption?: string;
+     }
+  | {
+       type: 'audio';
+       url: string;
+       caption?: string;
+     }
+  | {
+       type: 'document';
+       url: string;
+       caption?: string;
+     }
+  | {
+       type: 'button_row';
+       align?: 'left' | 'center' | 'right';
+       buttons: {
+         text: string;
+         style?: 'primary' | 'success' | 'danger' | 'link';
+         type: 'url' | 'copy_text';
+         url?: string;
+         copy_text?: string;
+       }[];
+     }
+  | {
+       type: 'footer';
+       text: string;
+     };
 
 export interface InputRichMessage {
   blocks?: InputRichBlock[];
@@ -56,10 +88,33 @@ export interface TelegramCallbackQuery {
   data?: string;
 }
 
+export interface ChannelItem {
+  id: string;
+  telegram_id: number;
+  title: string;
+  username?: string;
+  photo_url?: string;
+  created_at?: string;
+}
+
+export interface TelegramChatMemberUpdated {
+  chat: {
+    id: number;
+    title: string;
+    username?: string;
+    type: string;
+  };
+  from: TelegramUser;
+  date: number;
+  old_chat_member: { status: string };
+  new_chat_member: { status: string };
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
+  my_chat_member?: TelegramChatMemberUpdated;
 }
 
 export interface NotePayload {

@@ -24,7 +24,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       const results = await env.DB.batch([
         env.DB.prepare('SELECT language_code FROM users WHERE telegram_id = ?').bind(userId),
         env.DB.prepare('SELECT id, name, is_default FROM topics WHERE telegram_id = ? ORDER BY created_at ASC').bind(userId),
-        env.DB.prepare("SELECT id, category, title, content_raw, blocks_json, is_pinned, strftime('%Y-%m-%dT%H:%M:%SZ', updated_at) AS updated_at FROM notes WHERE telegram_id = ? ORDER BY is_pinned DESC, updated_at DESC").bind(userId),
+        env.DB.prepare("SELECT id, category, title, content_raw, blocks_json, is_pinned, strftime('%Y-%m-%dT%H:%M:%SZ', updated_at) AS updated_at FROM notes WHERE telegram_id = ? ORDER BY updated_at DESC").bind(userId),
       ]);
 
       const userRow = results[0].results[0] as { language_code?: string } | undefined;
@@ -87,6 +87,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       const statements: D1PreparedStatement[] = [];
 
       for (const note of body.notes) {
+        const isPinnedValue = (note as any).is_favorite !== undefined ? ((note as any).is_favorite ? 1 : 0) : (note.is_pinned ? 1 : 0);
         statements.push(
           env.DB.prepare(`
             INSERT INTO notes (id, telegram_id, category, title, content_raw, blocks_json, is_pinned, updated_at)
@@ -105,7 +106,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
             note.title,
             note.content_raw || '',
             JSON.stringify(note.blocks || []),
-            note.is_pinned ? 1 : 0
+            isPinnedValue
           )
         );
       }
@@ -179,56 +180,241 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     }
   }
 
+  if (request.method === 'GET' && path === '/api/channels') {
+    try {
+      const rows = await env.DB.prepare('SELECT id, title, username, photo_url FROM channels WHERE telegram_id = ? ORDER BY created_at ASC')
+        .bind(userId)
+        .all();
+      const botUsername = await telegram.getBotUsername();
+      return new Response(
+        JSON.stringify({ channels: rows.results, bot_username: botUsername }),
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+    } catch (error) {
+      console.error(`API_GET_CHANNELS_ERROR: ${(error as Error).message}`);
+      return new Response(JSON.stringify({ error: 'INTERNAL_SERVER_ERROR' }), { status: 500 });
+    }
+  }
+
+  if (request.method === 'POST' && path === '/api/channels/delete') {
+    try {
+      const body = (await request.json()) as { id: string };
+      await env.DB.prepare('DELETE FROM channels WHERE (id = ? OR id = ?) AND telegram_id = ?')
+        .bind(body.id, body.id.replace(/^-100/, '-'), userId)
+        .run();
+      console.log(`CHANNEL_DELETED_SUCCESS: channel=${body.id}, user=${userId}`);
+      await telegram.leaveChat(body.id);
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (error) {
+      console.error(`API_DELETE_CHANNEL_ERROR: ${(error as Error).message}`);
+      return new Response(JSON.stringify({ error: 'DELETE_FAILED' }), { status: 500 });
+    }
+  }
+
   if (request.method === 'POST' && path === '/api/notes/export') {
     try {
-      const payload = (await request.json()) as { note_id: string; note?: NotePayload };
+      const payload = (await request.json()) as {
+        note_id: string;
+        note?: NotePayload;
+        target_channel_ids?: string[];
+        send_to_user?: boolean;
+      };
       let blocks: any[] = [];
-
       if (payload.note && payload.note.blocks) {
         blocks = payload.note.blocks;
-        await env.DB.prepare(`
-          INSERT INTO notes (id, telegram_id, category, title, content_raw, blocks_json, is_pinned, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-          ON CONFLICT(id) DO UPDATE SET
-            title = excluded.title,
-            blocks_json = excluded.blocks_json,
-            updated_at = CURRENT_TIMESTAMP
-        `)
-          .bind(
-            payload.note.id,
-            userId,
-            payload.note.category,
-            payload.note.title,
-            payload.note.content_raw || '',
-            JSON.stringify(payload.note.blocks),
-            payload.note.is_pinned ? 1 : 0
-          )
-          .run();
       } else {
         const row = await env.DB.prepare('SELECT * FROM notes WHERE id = ? AND telegram_id = ?')
           .bind(payload.note_id, userId)
           .first();
-
         if (!row) {
           return new Response(JSON.stringify({ error: 'NOTE_NOT_FOUND' }), { status: 404 });
         }
         blocks = JSON.parse(row.blocks_json as string);
       }
 
-      const sendResult = await telegram.sendRichMessage(userId, { blocks });
-      if (!sendResult.ok && sendResult.errorCode === 403) {
-        const botUsername = await telegram.getBotUsername();
-        return new Response(JSON.stringify({ success: false, error: 'NEED_START_BOT', bot_username: botUsername }), {
-          headers: { 'Content-Type': 'application/json' },
-        });
+      let userSuccess = true;
+      if (payload.send_to_user !== false) {
+        const userResult = await telegram.sendRichMessage(userId, { blocks });
+        if (!userResult.ok && userResult.errorCode === 403) {
+          const botUsername = await telegram.getBotUsername();
+          return new Response(JSON.stringify({ success: false, error: 'NEED_START_BOT', bot_username: botUsername }), {
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        userSuccess = userResult.ok;
       }
 
-      return new Response(JSON.stringify({ success: sendResult.ok }), {
+      console.log(`[EXPORT] Received request: userId=${userId}, note_id=${payload.note_id}, target_channel_ids=${JSON.stringify(payload.target_channel_ids)}, send_to_user=${payload.send_to_user}`);
+
+      const channelIds = Array.isArray(payload.target_channel_ids) ? payload.target_channel_ids : [];
+      let channelSuccessCount = 0;
+
+      for (const chId of channelIds) {
+        console.log(`[EXPORT] Checking channel authorization: chId=${chId}, userId=${userId}`);
+        const verifyRow = await env.DB.prepare('SELECT id FROM channels WHERE (id = ? OR id = ?) AND telegram_id = ?')
+          .bind(chId, chId.replace(/^-100/, '-'), userId)
+          .first();
+
+        if (verifyRow) {
+          const normalizedTarget = chId.startsWith('-100') ? chId : chId.startsWith('-') ? `-100${chId.slice(1)}` : `-100${chId}`;
+          console.log(`[EXPORT] Authorized channel found. Sending message to ${normalizedTarget}`);
+          const chResult = await telegram.sendRichMessage(normalizedTarget, { blocks });
+          console.log(`[EXPORT] Channel send result: target=${normalizedTarget}, ok=${chResult.ok}, code=${chResult.errorCode}, desc=${chResult.description}`);
+          if (chResult.ok) channelSuccessCount++;
+        } else {
+          console.warn(`[EXPORT] Channel not found or unauthorized: chId=${chId}, userId=${userId}`);
+        }
+      }
+
+      const isOverallSuccess = channelIds.length > 0 ? channelSuccessCount > 0 : userSuccess;
+      console.log(`[EXPORT] Completed: isOverallSuccess=${isOverallSuccess}, channelSuccessCount=${channelSuccessCount}`);
+      return new Response(JSON.stringify({ success: isOverallSuccess, channels_posted: channelSuccessCount }), {
         headers: { 'Content-Type': 'application/json' },
       });
     } catch (error) {
-      console.error(`API_EXPORT_NOTE_ERROR: ${(error as Error).message}`);
+      console.error(`[EXPORT] Exception occurred: ${(error as Error).message}`);
       return new Response(JSON.stringify({ error: 'EXPORT_FAILED' }), { status: 500 });
+    }
+  }
+  if (request.method === 'POST' && path === '/api/media/catbox') {
+    try {
+      const formData = await request.formData();
+      const file = formData.get('file') as unknown as File | null;
+      if (!file || typeof (file as any).arrayBuffer !== 'function') {
+        return new Response(JSON.stringify({ error: 'INVALID_FILE' }), { status: 400 });
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        return new Response(JSON.stringify({ error: 'FILE_TOO_LARGE' }), { status: 400 });
+      }
+
+      const buffer = await file.arrayBuffer();
+      const blob = new Blob([buffer], { type: file.type || 'application/octet-stream' });
+      
+      const upstreamForm = new FormData();
+      upstreamForm.append('reqtype', 'fileupload');
+      upstreamForm.append('time', '72h');
+      upstreamForm.append('fileToUpload', blob, file.name || 'upload.bin');
+
+      const litterboxRes = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
+        method: 'POST',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        },
+        body: upstreamForm,
+      });
+
+      const responseUrl = (await litterboxRes.text()).trim();
+      if (!litterboxRes.ok || !responseUrl.startsWith('http')) {
+        console.error(`LITTERBOX_UPSTREAM_FAILED: status=${litterboxRes.status}, body=${responseUrl}`);
+        return new Response(JSON.stringify({ error: 'UPLOAD_FAILED' }), { status: 502 });
+      }
+
+      return new Response(JSON.stringify({ success: true, url: responseUrl }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (error) {
+      console.error(`API_MEDIA_LITTERBOX_ERROR: ${(error as Error).message}`);
+      return new Response(JSON.stringify({ error: 'UPLOAD_FAILED' }), { status: 500 });
+    }
+  }
+
+  if (request.method === 'POST' && path === '/api/media/upload') {
+    try {
+      const keys = (env.IMGBB_API_KEYS || '')
+        .split(',')
+        .map((k) => k.trim())
+        .filter(Boolean);
+
+      if (keys.length === 0) {
+        console.error('IMGBB_NOT_CONFIGURED: IMGBB_API_KEYS is missing in env');
+        return new Response(JSON.stringify({ error: 'IMGBB_NOT_CONFIGURED' }), { status: 500 });
+      }
+
+      const formData = await request.formData();
+      const imageFile = formData.get('image') as unknown as { arrayBuffer?: () => Promise<ArrayBuffer> } | null;
+      if (!imageFile || typeof imageFile.arrayBuffer !== 'function') {
+        return new Response(JSON.stringify({ error: 'INVALID_FILE' }), { status: 400 });
+      }
+
+      const fileBuffer = await imageFile.arrayBuffer();
+      const imageBlob = new Blob([fileBuffer]);
+
+      let lastError = '';
+      for (let i = 0; i < keys.length; i++) {
+        const currentKey = keys[i];
+        try {
+          const imgbbForm = new FormData();
+          imgbbForm.append('image', imageBlob, 'upload.jpg');
+
+          const imgbbRes = await fetch(`https://api.imgbb.com/1/upload?key=${currentKey}`, {
+            method: 'POST',
+            body: imgbbForm,
+          });
+
+          const data = (await imgbbRes.json()) as {
+            success?: boolean;
+            data?: { url: string; delete_url?: string };
+            error?: { message: string };
+          };
+
+          if (imgbbRes.ok && data.success && data.data?.url) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                url: data.data.url,
+                delete_url: data.data.delete_url,
+              }),
+              {
+                headers: { 'Content-Type': 'application/json' },
+              }
+            );
+          }
+          lastError = data.error?.message || `HTTP_${imgbbRes.status}`;
+          console.warn(`IMGBB_KEY_FAILED: index=${i}, error=${lastError}`);
+        } catch (err) {
+          lastError = (err as Error).message;
+          console.warn(`IMGBB_REQ_EXCEPTION: index=${i}, error=${lastError}`);
+        }
+      }
+
+      console.error(`IMGBB_ALL_KEYS_FAILED: ${lastError}`);
+      return new Response(JSON.stringify({ error: 'ALL_KEYS_EXHAUSTED' }), { status: 502 });
+    } catch (error) {
+      console.error(`API_MEDIA_UPLOAD_ERROR: ${(error as Error).message}`);
+      return new Response(JSON.stringify({ error: 'UPLOAD_FAILED' }), { status: 500 });
+    }
+  }
+
+  if (request.method === 'POST' && path === '/api/media/delete') {
+    try {
+      const body = (await request.json()) as { delete_url?: string };
+      if (!body.delete_url || !body.delete_url.startsWith('https://ibb.co/')) {
+        return new Response(JSON.stringify({ error: 'INVALID_URL' }), { status: 400 });
+      }
+      const pageRes = await fetch(body.delete_url);
+      const html = await pageRes.text();
+      const tokenMatch = html.match(/auth_token\s*=\s*["']([a-f0-9]+)["']/i) || html.match(/name="auth_token"\s+value="([^"]+)"/i);
+      const authToken = tokenMatch ? tokenMatch[1] : '';
+      const formBody = new URLSearchParams();
+      formBody.append('action', 'delete');
+      if (authToken) {
+        formBody.append('auth_token', authToken);
+      }
+      const delRes = await fetch(body.delete_url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: formBody.toString(),
+      });
+      return new Response(JSON.stringify({ success: delRes.ok }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (error) {
+      console.error(`API_MEDIA_DELETE_ERROR: ${(error as Error).message}`);
+      return new Response(JSON.stringify({ error: 'DELETE_FAILED' }), { status: 500 });
     }
   }
 
