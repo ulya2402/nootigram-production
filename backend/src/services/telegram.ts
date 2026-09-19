@@ -107,9 +107,11 @@ export class TelegramService {
           if (/^<\/code>$/i.test(part)) return '</code>';
           if (/^<tg-spoiler>$/i.test(part)) return '<tg-spoiler>';
           if (/^<\/tg-spoiler>$/i.test(part)) return '</tg-spoiler>';
+          if (/^<mark>$/i.test(part)) return '<mark>';
+          if (/^<\/mark>$/i.test(part)) return '</mark>';
           if (/^<tg-time(?:\s+[^>]*)?>$/i.test(part)) return part;
           if (/^<\/tg-time>$/i.test(part)) return '</tg-time>';
-          if (/^<a\s+href="[^"]*">$/i.test(part)) return part;
+          if (/^<a\s+(?:href="[^"]*"|name="[^"]*")>$/i.test(part)) return part;
           if (/^<\/a>$/i.test(part)) return '</a>';
           return part.replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
@@ -119,7 +121,7 @@ export class TelegramService {
           .replace(/>/g, '&gt;');
       })
       .join('');
-    const tags = ['b', 'i', 'u', 's', 'code', 'tg-spoiler', 'a', 'tg-time'];
+    const tags = ['b', 'i', 'u', 's', 'code', 'tg-spoiler', 'a', 'tg-time', 'mark'];
     for (const tag of tags) {
       const openCount = (formatted.match(new RegExp(`<${tag}(?:\\s[^>]*)?>`, 'gi')) || []).length;
       const closeCount = (formatted.match(new RegExp(`</${tag}>`, 'gi')) || []).length;
@@ -149,7 +151,10 @@ export class TelegramService {
       if (b.type === 'heading') {
         const size = b.size || 2;
         const text = this.escapeText(b.text);
-        if (text) html += `<h${size}>${text}</h${size}>\n`;
+        const headingId = (b as { id?: string }).id;
+        const anchorName = headingId ? `chapter-${this.escapeText(headingId)}` : '';
+        const anchorTag = anchorName ? `<a name="${anchorName}"></a>` : '';
+        if (text) html += `${anchorTag}<h${size}>${text}</h${size}>\n`;
       } else if (b.type === 'paragraph') {
         const text = this.formatInlineHtml(b.text);
         if (text) html += `<p>${text}</p>\n`;
@@ -180,13 +185,13 @@ export class TelegramService {
         if (b.is_striped) attrs += ' striped';
         if (b.is_compact) attrs += ' compact';
         let tbl = `<table${attrs}>`;
-        if (b.caption) tbl += `<caption>${this.escapeText(b.caption)}</caption>`;
+        if (b.caption) tbl += `<caption>${this.formatInlineHtml(b.caption)}</caption>`;
         for (let rIdx = 0; rIdx < b.cells.length; rIdx++) {
           tbl += '<tr>';
           for (const cell of b.cells[rIdx]) {
             const tag = cell.is_header || rIdx === 0 ? 'th' : 'td';
             const align = cell.align ? ` align="${cell.align}"` : '';
-            tbl += `<${tag}${align}>${this.escapeText(cell.text)}</${tag}>`;
+            tbl += `<${tag}${align}>${this.formatInlineHtml(cell.text)}</${tag}>`;
           }
           tbl += '</tr>';
         }
@@ -220,7 +225,7 @@ export class TelegramService {
         }
       } else if (b.type === 'details') {
         const detText = (b.blocks && b.blocks[0] && 'text' in b.blocks[0] ? (b.blocks[0] as any).text : '') || (b as any).text || '';
-        html += `<details><summary>${this.escapeText(b.summary)}</summary>${this.formatInlineHtml(detText)}</details>\n\n`;
+        html += `<details><summary>${this.formatInlineHtml(b.summary)}</summary>${this.formatInlineHtml(detText)}</details>\n\n`;
       } else if (b.type === 'media') {
         const captionText = b.caption ? this.escapeText(b.caption) : '';
         const captionTag = captionText ? `<figcaption>${captionText}</figcaption>` : '';
