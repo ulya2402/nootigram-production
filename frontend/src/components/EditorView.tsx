@@ -2,8 +2,8 @@ import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from
 import { createPortal } from 'react-dom';
 import { NoteItem, ContentBlock, TaskItem, TableCell, TopicItem, MediaImageItem, ChannelItem } from '../types';
 import { t } from '../services/i18n';
-import { exportNoteToTelegram, uploadToCatbox } from '../services/api';
-import { uploadToImgbb, deleteFromImgbb } from '../services/imgbb';
+import { exportNoteToTelegram, uploadMediaToBackend } from '../services/api';
+import { compressImage, deleteFromImgbb } from '../services/imgbb';
 
 interface EditorViewProps {
   note: NoteItem;
@@ -236,12 +236,36 @@ export const EditorView: React.FC<EditorViewProps> = ({
 
   const savedRangeRef = useRef<Range | null>(null);
 
+  const forceDismissKeyboard = () => {
+    setIsEditorActive(false);
+    const sel = window.getSelection();
+    if (sel) sel.removeAllRanges(); // Menghapus sorotan teks agar tombol "Salin" hilang
+    
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+    
+    // Trik khusus memaksa keyboard HP menutup
+    const tempInput = document.createElement('input');
+    tempInput.setAttribute('readonly', 'readonly');
+    tempInput.setAttribute('style', 'position:fixed; top:-9999px; left:-9999px; opacity:0;');
+    document.body.appendChild(tempInput);
+    tempInput.focus();
+    setTimeout(() => {
+      tempInput.blur();
+      if (document.body.contains(tempInput)) document.body.removeChild(tempInput);
+    }, 15);
+  };
+
   const openTimePicker = () => {
     triggerHaptic('light');
     const sel = window.getSelection();
     if (sel && sel.rangeCount > 0) {
       savedRangeRef.current = sel.getRangeAt(0).cloneRange();
     }
+    
+    forceDismissKeyboard(); // Panggil fungsi pemaksa tutup di sini
+    
     const now = new Date();
     const year = now.getFullYear();
     const month = String(now.getMonth() + 1).padStart(2, '0');
@@ -356,20 +380,20 @@ const triggerUploadDoc = () => {
 };
 
 const handleAudioFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
-  const file = e.target.files?.[0];
-  if (!file) return;
-  e.target.value = '';
-  if (file.size > 10 * 1024 * 1024) {
-    triggerHaptic('heavy');
-    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
-    alert(t('file_size_exceeded'));
-    return;
-  }
-  setIsUploadingGlobal(true);
-  setUploadingMediaType('audio');
-  try {
-    const result = await uploadToCatbox(file);
-    const newBlock: ContentBlock = {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+    if (file.size > 10 * 1024 * 1024) {
+      triggerHaptic('heavy');
+      window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
+      alert(t('file_size_exceeded'));
+      return;
+    }
+    setIsUploadingGlobal(true);
+    setUploadingMediaType('audio');
+    try {
+      const result = await uploadMediaToBackend(file);
+      const newBlock: ContentBlock = {
       id: `b-audio-${Date.now()}`,
       type: 'audio',
       url: result.url,
@@ -407,19 +431,19 @@ const handleAudioFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) =
 };
 
 const handleDocFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
-  const file = e.target.files?.[0];
-  if (!file) return;
-  e.target.value = '';
-  if (file.size > 10 * 1024 * 1024) {
-    triggerHaptic('heavy');
-    alert(t('file_size_exceeded'));
-    return;
-  }
-  setIsUploadingGlobal(true);
-  setUploadingMediaType('file');
-  try {
-    const result = await uploadToCatbox(file);
-    const newBlock: ContentBlock = {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+    if (file.size > 10 * 1024 * 1024) {
+      triggerHaptic('heavy');
+      alert(t('file_size_exceeded'));
+      return;
+    }
+    setIsUploadingGlobal(true);
+    setUploadingMediaType('file');
+    try {
+      const result = await uploadMediaToBackend(file);
+      const newBlock: ContentBlock = {
       id: `b-doc-${Date.now()}`,
       type: 'file',
       url: result.url,
@@ -601,75 +625,82 @@ const triggerAddSecondImage = (blockIndex: number) => {
 };
 
 const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
-  const file = e.target.files?.[0];
-  if (!file) return;
-  e.target.value = '';
-
-  const targetIdx = targetMediaBlockIndexRef.current;
-  const tempImgId = `img-${Date.now()}`;
-  setIsUploadingGlobal(true);
-
-  if (targetIdx !== null && currentNote.blocks[targetIdx]?.type === 'media') {
-    setUploadingBlockId(currentNote.blocks[targetIdx].id);
-  }
-
-  try {
-    const result = await uploadToImgbb(file);
-    const newImgItem: MediaImageItem = {
-      id: tempImgId,
-      url: result.url,
-      delete_url: result.delete_url,
-    };
-
-    if (targetIdx !== null && currentNote.blocks[targetIdx]?.type === 'media') {
-      const existingBlock = currentNote.blocks[targetIdx] as Extract<ContentBlock, { type: 'media' }>;
-      const nextImages = [...existingBlock.images, newImgItem].slice(0, 2);
-      const nextBlock: ContentBlock = {
-        ...existingBlock,
-        layout: 'collage',
-        images: nextImages,
-      };
-      updateBlock(targetIdx, nextBlock, true);
-    } else {
-      const newBlockId = `b-media-${Date.now()}`;
-      const newBlock: ContentBlock = {
-        id: newBlockId,
-        type: 'media',
-        layout: 'single',
-        caption: '',
-        images: [newImgItem],
-      };
-      const trailingParagraph: ContentBlock = {
-        id: `p-${Date.now()}`,
-        type: 'paragraph',
-        text: '',
-      };
-
-      const targetPos = focusedBlockIndex !== null && focusedBlockIndex >= 0 && focusedBlockIndex < currentNote.blocks.length
-        ? focusedBlockIndex + 1
-        : currentNote.blocks.length;
-
-      const nextBlocks = [
-        ...currentNote.blocks.slice(0, targetPos),
-        newBlock,
-        trailingParagraph,
-        ...currentNote.blocks.slice(targetPos),
-      ];
-
-      persistChange({ ...currentNote, blocks: nextBlocks }, true);
-      setFocusedBlockIndex(targetPos);
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+    
+    // Tambahan pembatasan ukuran maksimal 10MB untuk gambar agar aman
+    if (file.size > 10 * 1024 * 1024) {
+      triggerHaptic('heavy');
+      window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
+      alert(t('file_size_exceeded'));
+      return;
     }
 
-    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('success');
-  } catch (err) {
-    console.error(`IMAGE_UPLOAD_FAILED: ${(err as Error).message}`);
-    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
-  } finally {
-    setIsUploadingGlobal(false);
-    setUploadingBlockId(null);
-    targetMediaBlockIndexRef.current = null;
-  }
-};
+    const targetIdx = targetMediaBlockIndexRef.current;
+    const tempImgId = `img-${Date.now()}`;
+    
+    setIsUploadingGlobal(true);
+    setUploadingMediaType('image'); // INI YANG MEMBUAT ANIMASI LOADING MUNCUL
+    
+    if (targetIdx !== null && currentNote.blocks[targetIdx]?.type === 'media') {
+      setUploadingBlockId(currentNote.blocks[targetIdx].id);
+    }
+    
+    try {
+      const compressedFile = await compressImage(file, 0.75, 1440); // KOMPRESI KEMBALI AKTIF
+      const result = await uploadMediaToBackend(compressedFile);
+      const newImgItem: MediaImageItem = {
+        id: tempImgId,
+        url: result.url,
+      };
+      
+      if (targetIdx !== null && currentNote.blocks[targetIdx]?.type === 'media') {
+        const existingBlock = currentNote.blocks[targetIdx] as Extract<ContentBlock, { type: 'media' }>;
+        const nextImages = [...existingBlock.images, newImgItem].slice(0, 2);
+        const nextBlock: ContentBlock = {
+          ...existingBlock,
+          layout: 'collage',
+          images: nextImages,
+        };
+        updateBlock(targetIdx, nextBlock, true);
+      } else {
+        const newBlockId = `b-media-${Date.now()}`;
+        const newBlock: ContentBlock = {
+          id: newBlockId,
+          type: 'media',
+          layout: 'single',
+          caption: '',
+          images: [newImgItem],
+        };
+        const trailingParagraph: ContentBlock = {
+          id: `p-${Date.now()}`,
+          type: 'paragraph',
+          text: '',
+        };
+        const targetPos = focusedBlockIndex !== null && focusedBlockIndex >= 0 && focusedBlockIndex < currentNote.blocks.length
+          ? focusedBlockIndex + 1
+          : currentNote.blocks.length;
+        const nextBlocks = [
+          ...currentNote.blocks.slice(0, targetPos),
+          newBlock,
+          trailingParagraph,
+          ...currentNote.blocks.slice(targetPos),
+        ];
+        persistChange({ ...currentNote, blocks: nextBlocks }, true);
+        setFocusedBlockIndex(targetPos);
+      }
+      window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('success');
+    } catch (err) {
+      console.error(`IMAGE_UPLOAD_FAILED: ${(err as Error).message}`);
+      window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred('error');
+    } finally {
+      setIsUploadingGlobal(false);
+      setUploadingMediaType(null); // MATIKAN ANIMASI LOADING SETELAH SELESAI
+      setUploadingBlockId(null);
+      targetMediaBlockIndexRef.current = null;
+    }
+  };
 
 const toggleMediaLayout = (blockIndex: number, newLayout: 'collage' | 'slideshow') => {
   triggerHaptic('light');
@@ -732,13 +763,9 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
     const existingAnchor = (parentNode as HTMLElement)?.closest('a');
     const linkText = existingAnchor ? (existingAnchor.textContent || '') : range.toString().trim();
     const linkHref = existingAnchor ? (existingAnchor.getAttribute('href') || '') : '';
-
-    sel.removeAllRanges();
-    if (document.activeElement instanceof HTMLElement) {
-      document.activeElement.blur();
-    }
-    setIsEditorActive(false);
-
+    
+    forceDismissKeyboard();
+    
     setLinkModal({
       isOpen: true,
       url: linkHref,
@@ -1410,7 +1437,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
         primaryBlock = { id: bId1, type: 'math', expression: 'E = mc^2' };
         break;
       case 'details':
-        primaryBlock = { id: bId1, type: 'details', summary: '', text: '' };
+        primaryBlock = { id: bId1, type: 'details', summary: '', text: '', is_open: false };
         break;
       case 'divider':
         primaryBlock = { id: bId1, type: 'divider' };
@@ -1645,10 +1672,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
 
   const handleOpenButtonConfig = (blockIndex: number, buttonIndex: number, btn: any) => {
     triggerHaptic('light');
-    setIsEditorActive(false);
-    if (document.activeElement instanceof HTMLElement) {
-      document.activeElement.blur();
-    }
+    forceDismissKeyboard();
     setFocusedBlockIndex(blockIndex);
     setEditingButtonModal({
       blockIndex,
@@ -1922,6 +1946,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
           type: 'details',
           summary: b.summary,
           blocks: [{ type: 'paragraph', text: b.text }],
+          is_open: Boolean(b.is_open),
         });
       } else if (b.type === 'divider') {
         richBlocks.push({ type: 'divider' });
@@ -2055,10 +2080,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
             <button
               onClick={() => {
                 triggerHaptic('light');
-                setIsEditorActive(false);
-                if (document.activeElement instanceof HTMLElement) {
-                  document.activeElement.blur();
-                }
+                forceDismissKeyboard();
                 setShowExportModal(true);
               }}
               disabled={isExporting}
@@ -2412,7 +2434,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                     }}
                     onChange={(newHtml) => updateBlock(index, { ...block, text: newHtml })}
                     onKeyDown={(e) => handleParagraphKeyDown(e, index)}
-                    className="w-full text-[15px] leading-relaxed text-warm-text bg-transparent border-none focus:outline-none min-h-[24px]"
+                    className="w-full text-[15px] leading-relaxed text-warm-text bg-transparent border-none focus:outline-none min-h-[24px] py-0.5"
                   />
                 )}
 
@@ -2546,16 +2568,17 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                 {block.type === 'list' && (
                   <div className="flex flex-col gap-1.5 py-1">
                     {block.items.map((item, itemIdx) => (
-                      <div key={item.id} className="flex items-center gap-2">
+                      <div key={item.id} className="flex items-start gap-2">
                         {block.style === 'task' ? (
                           <button
+                            type="button"
                             onClick={() => {
                               triggerHaptic();
                               const newItems = [...block.items];
                               newItems[itemIdx].is_checked = !newItems[itemIdx].is_checked;
                               updateBlock(index, { ...block, items: newItems }, true);
                             }}
-                            className={`w-4 h-4 rounded flex items-center justify-center transition-colors ${
+                            className={`w-4 h-4 rounded flex items-center justify-center transition-colors shrink-0 mt-0.5 ${
                               item.is_checked ? 'bg-[#5F7466] text-white' : 'border border-warm-subtle bg-transparent'
                             }`}
                           >
@@ -2564,18 +2587,21 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                             )}
                           </button>
                         ) : block.style === 'ordered' ? (
-                          <span className="text-xs font-mono text-warm-accent font-semibold w-4 text-center">
+                          <span className="text-xs font-mono text-warm-accent font-semibold w-4 text-center shrink-0 mt-0.5">
                             {itemIdx + 1}.
                           </span>
                         ) : (
-                          <span className="text-base text-warm-accent leading-none w-4 text-center">•</span>
+                          <span className="text-base text-warm-accent leading-none w-4 text-center shrink-0 mt-0.5">•</span>
                         )}
-
-                        <input
+                        <textarea
+                          rows={1}
                           id={item.id}
-                          type="text"
                           value={item.text}
                           placeholder={t('task_placeholder')}
+                          ref={(el) => {
+                            if (el) autoResize(el);
+                          }}
+                          onInput={(e) => autoResize(e.currentTarget)}
                           onFocus={() => setFocusedBlockIndex(index)}
                           onKeyDown={(e) => {
                             if (e.key === 'Enter') {
@@ -2590,7 +2616,11 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                               });
                               updateBlock(index, { ...block, items: newItems }, true);
                               setTimeout(() => {
-                                document.getElementById(newTaskId)?.focus();
+                                const nextEl = document.getElementById(newTaskId) as HTMLTextAreaElement | null;
+                                if (nextEl) {
+                                  nextEl.focus();
+                                  autoResize(nextEl);
+                                }
                               }, 50);
                             } else if (e.key === 'Backspace' && item.text === '' && block.items.length > 1) {
                               e.preventDefault();
@@ -2600,23 +2630,28 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                               const prevItem = block.items[itemIdx - 1];
                               if (prevItem) {
                                 setTimeout(() => {
-                                  document.getElementById(prevItem.id)?.focus();
+                                  const prevEl = document.getElementById(prevItem.id) as HTMLTextAreaElement | null;
+                                  if (prevEl) {
+                                    prevEl.focus();
+                                    autoResize(prevEl);
+                                  }
                                 }, 50);
                               }
                             }
                           }}
                           onChange={(e) => {
                             const newItems = [...block.items];
-                            newItems[itemIdx].text = e.target.value;
+                            newItems[itemIdx].text = e.target.value.replace(/\r?\n/g, ' ');
                             updateBlock(index, { ...block, items: newItems }, false);
                           }}
-                          className={`text-sm bg-transparent border-none focus:outline-none flex-1 ${
+                          className={`text-sm bg-transparent border-none focus:outline-none flex-1 p-0 leading-5 resize-none overflow-hidden break-words w-full ${
                             item.is_checked ? 'line-through text-warm-muted' : 'text-warm-text'
                           }`}
                         />
                       </div>
                     ))}
                     <button
+                      type="button"
                       onClick={() => {
                         triggerHaptic();
                         const newTaskId = `task-${Date.now()}`;
@@ -2626,7 +2661,11 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                         ];
                         updateBlock(index, { ...block, items: newItems }, true);
                         setTimeout(() => {
-                          document.getElementById(newTaskId)?.focus();
+                          const nextEl = document.getElementById(newTaskId) as HTMLTextAreaElement | null;
+                          if (nextEl) {
+                            nextEl.focus();
+                            autoResize(nextEl);
+                          }
                         }, 50);
                       }}
                       className="text-xs text-warm-accent font-medium self-start flex items-center gap-1 mt-0.5"
@@ -2636,6 +2675,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                     </button>
                   </div>
                 )}
+                
                 {block.type === 'audio' && (
                   <div className="my-2.5 p-3 rounded-2xl bg-cream-surface/75 border border-cream-divider/80 flex flex-col gap-2.5 shadow-xs w-full min-w-0 transition-all">
                     <div className="flex items-center justify-between gap-2 border-b border-cream-divider/50 pb-2">
@@ -2681,13 +2721,13 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                         href={block.url}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="flex items-center gap-2.5 min-w-0 flex-1 group/doc"
+                        className="flex items-center gap-2.5 min-w-0 flex-1 group/doc no-underline"
                       >
                         <div className="w-8 h-8 rounded-xl bg-warm-text text-[#FAF8F5] flex items-center justify-center shrink-0">
                           <span className="material-symbols-outlined text-[18px]">attachment</span>
                         </div>
                         <div className="flex flex-col min-w-0">
-                          <span className="text-xs font-semibold text-warm-text group-hover/doc:text-warm-accent truncate transition-colors">{block.name}</span>
+                          <span className="text-xs font-semibold text-warm-text group-hover/doc:text-warm-accent truncate transition-colors no-underline">{block.name}</span>
                           <span className="text-[10px] font-mono text-warm-muted">{formatFileSize(block.size)}</span>
                         </div>
                       </a>
@@ -2699,7 +2739,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                         <span className="material-symbols-outlined text-[15px]">close</span>
                       </button>
                     </div>
-                    <div className="border-t border-cream-divider/40 pt-1">
+                    <div className="pt-1">
                       <input
                         type="text"
                         value={block.caption || ''}
@@ -3132,12 +3172,12 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                 )}
 
                 {block.type === 'details' && (
-                  <div className="w-full my-2 rounded-xl border border-cream-divider/80 bg-cream-surface/40 overflow-hidden transition-all">
+                  <div className="w-full my-2 rounded-xl border border-cream-divider/80 bg-cream-surface/40 overflow-hidden transition-all duration-200">
                     <div
                       onClick={() => toggleDetails(block.id)}
-                      className="flex items-center justify-between px-3 py-2 bg-cream-surface/60 cursor-pointer select-none"
+                      className="flex items-center justify-between px-3 py-2 bg-cream-surface/60 cursor-pointer select-none gap-2"
                     >
-                      <div onClick={(e) => e.stopPropagation()} className="flex-1 min-w-0 pr-2">
+                      <div onClick={(e) => e.stopPropagation()} className="flex-1 min-w-0 pr-1">
                         <EditableBlock
                           html={block.summary}
                           placeholder={t('details_summary_placeholder')}
@@ -3151,22 +3191,42 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                           className="w-full text-xs font-semibold text-warm-text bg-transparent border-none focus:outline-none min-h-[18px]"
                         />
                       </div>
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleDetails(block.id);
-                        }}
-                        className="w-5 h-5 flex items-center justify-center text-warm-muted transition-transform duration-200 shrink-0"
-                        style={{
-                          transform: openDetailsMap[block.id] !== false ? 'rotate(180deg)' : 'rotate(0deg)',
-                        }}
-                      >
-                        <span className="material-symbols-outlined text-[16px]">expand_more</span>
-                      </button>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            triggerHaptic('light');
+                            updateBlock(index, { ...block, is_open: !block.is_open }, true);
+                          }}
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-semibold flex items-center gap-1 transition-all duration-200 active:scale-95 ${
+                            block.is_open
+                              ? 'bg-warm-accent text-white shadow-xs'
+                              : 'bg-[#FAF8F5] text-warm-muted border border-cream-divider/80 hover:text-warm-text'
+                          }`}
+                        >
+                          <span className={`material-symbols-outlined text-[13px] leading-none transition-transform duration-200 ${block.is_open ? 'rotate-180' : 'rotate-0'}`}>
+                            {block.is_open ? 'unfold_more' : 'unfold_less'}
+                          </span>
+                          <span>{block.is_open ? t('details_auto_open') : t('details_collapsed')}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleDetails(block.id);
+                          }}
+                          className="w-6 h-6 flex items-center justify-center text-warm-muted hover:text-warm-text transition-transform duration-200 shrink-0"
+                          style={{
+                            transform: openDetailsMap[block.id] !== false ? 'rotate(180deg)' : 'rotate(0deg)',
+                          }}
+                        >
+                          <span className="material-symbols-outlined text-[16px]">expand_more</span>
+                        </button>
+                      </div>
                     </div>
                     <div
-                      className={`grid transition-[grid-template-rows,opacity] duration-200 ease-out ${
+                      className={`grid transition-[grid-template-rows,opacity] duration-300 ease-out ${
                         openDetailsMap[block.id] !== false
                           ? 'grid-rows-[1fr] opacity-100'
                           : 'grid-rows-[0fr] opacity-0 pointer-events-none'
@@ -3213,7 +3273,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                   </div>
                 )}
                 {block.type === 'footer' && (
-                  <div className="w-full my-2 flex flex-col gap-1 transition-all border-t border-cream-divider/50 pt-1.5">
+                  <div className="w-full my-2 flex flex-col gap-1 transition-all pt-1">
                     <div className="flex items-center justify-between pb-0.5">
                       <span className="text-[10px] font-semibold uppercase tracking-wider text-warm-subtle flex items-center gap-1">
                         <span className="material-symbols-outlined text-[13px]">short_text</span>
@@ -3578,35 +3638,28 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
           <div
             data-modal="true"
             onClick={() => setLinkModal((prev) => ({ ...prev, isOpen: false }))}
-            className="fixed inset-0 z-50 flex flex-col justify-end bg-[#24201D]/45 transition-opacity duration-150"
+            className="fixed inset-0 z-50 flex justify-center bg-[#FAF8F5] animate-sheet-up"
           >
             <div
-              data-modal="true"
               onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-[420px] mx-auto bg-[#FAF8F5] rounded-t-3xl border-t border-cream-divider px-6 pt-3 pb-6 flex flex-col gap-3.5 shadow-xl animate-sheet-up"
-              style={{
-                paddingBottom: keyboardInset > 0
-                  ? `${keyboardInset + 16}px`
-                  : 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 18px)',
-              }}
+              className="w-full max-w-[420px] h-full flex flex-col bg-[#FAF8F5]"
             >
-              <div className="w-10 h-1 rounded-full bg-cream-divider self-center shrink-0 mb-1" />
-              <div className="flex items-center justify-between pb-1 border-b border-cream-divider/50">
-                <span className="text-xs font-semibold uppercase tracking-wider text-warm-text">
+              <div className="flex items-center justify-between px-6 pt-5 pb-3 shrink-0">
+                <span className="text-sm font-semibold tracking-wide text-warm-text">
                   {t('link_modal_title')}
                 </span>
                 <button
                   type="button"
                   onClick={() => setLinkModal((prev) => ({ ...prev, isOpen: false }))}
-                  className="w-6 h-6 flex items-center justify-center rounded-full text-warm-muted hover:text-warm-text"
+                  className="w-8 h-8 flex items-center justify-center rounded-full text-warm-muted hover:bg-cream-surface transition-colors"
                 >
-                  <span className="material-symbols-outlined text-[16px]">close</span>
+                  <span className="material-symbols-outlined text-[20px]">close</span>
                 </button>
               </div>
 
-              <div className="flex flex-col gap-3">
+              <div className="flex-1 overflow-y-auto px-6 py-2 flex flex-col gap-6">
                 <div className="flex flex-col gap-1">
-                  <label className="text-[10px] font-semibold uppercase text-warm-muted">
+                  <label className="text-[10px] font-semibold uppercase tracking-widest text-warm-subtle">
                     {t('link_url_label')}
                   </label>
                   <input
@@ -3616,12 +3669,11 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                     onChange={(e) =>
                       setLinkModal((prev) => ({ ...prev, url: e.target.value }))
                     }
-                    className="w-full bg-cream-surface rounded-xl px-3 py-2 text-xs text-warm-text border-none focus:outline-none font-mono"
+                    className="w-full bg-transparent border-b border-cream-divider px-1 py-2.5 text-sm text-warm-text focus:outline-none focus:border-warm-accent transition-colors font-mono"
                   />
                 </div>
-
                 <div className="flex flex-col gap-1">
-                  <label className="text-[10px] font-semibold uppercase text-warm-muted">
+                  <label className="text-[10px] font-semibold uppercase tracking-widest text-warm-subtle">
                     {t('link_text_label')}
                   </label>
                   <input
@@ -3631,16 +3683,15 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                     onChange={(e) =>
                       setLinkModal((prev) => ({ ...prev, text: e.target.value }))
                     }
-                    className="w-full bg-cream-surface rounded-xl px-3 py-2 text-xs text-warm-text border-none focus:outline-none"
+                    className="w-full bg-transparent border-b border-cream-divider px-1 py-2.5 text-sm text-warm-text focus:outline-none focus:border-warm-accent transition-colors"
                   />
                 </div>
-
                 {headingsList.length > 0 && (
-                  <div className="flex flex-col gap-1.5 pt-1">
-                    <span className="text-[10px] font-semibold uppercase text-warm-muted">
+                  <div className="flex flex-col gap-3 pt-4">
+                    <span className="text-[10px] font-semibold uppercase tracking-widest text-warm-subtle">
                       {t('link_headings_hint')}
                     </span>
-                    <div className="flex items-center gap-1.5 flex-wrap max-h-24 overflow-y-auto no-scrollbar">
+                    <div className="flex items-center gap-2 flex-wrap">
                       {headingsList.map((h) => (
                         <button
                           key={h.id}
@@ -3653,13 +3704,13 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                               text: prev.text || h.text,
                             }));
                           }}
-                          className={`text-[10px] px-2.5 py-1 rounded-lg border transition-colors ${
+                          className={`text-[11px] px-3.5 py-1.5 rounded-full border transition-all ${
                             linkModal.url === `#chapter-${h.id}`
-                              ? 'bg-warm-accent-light border-warm-accent text-warm-accent font-semibold'
-                              : 'bg-cream-surface border-cream-divider text-warm-text hover:border-warm-subtle'
+                              ? 'bg-warm-text border-warm-text text-[#FAF8F5] font-medium'
+                              : 'bg-transparent border-cream-divider text-warm-muted hover:text-warm-text'
                           }`}
                         >
-                          #{h.text}
+                          {h.text}
                         </button>
                       ))}
                     </div>
@@ -3667,12 +3718,19 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                 )}
               </div>
 
-              <div className="flex items-center justify-between gap-2 pt-2 border-t border-cream-divider/50">
+              <div 
+                className="px-6 py-4 flex items-center justify-between gap-3 shrink-0"
+                style={{
+                  paddingBottom: keyboardInset > 0
+                    ? `${keyboardInset + 16}px`
+                    : 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 16px)',
+                }}
+              >
                 {linkModal.isEditing ? (
                   <button
                     type="button"
                     onClick={removeLink}
-                    className="px-3.5 py-1.5 rounded-full text-xs font-semibold text-red-600 bg-red-50 active:scale-95 transition-transform"
+                    className="px-5 py-2.5 rounded-full text-xs font-semibold text-red-600 bg-red-50 hover:bg-red-100 active:scale-95 transition-all"
                   >
                     {t('link_remove')}
                   </button>
@@ -3680,7 +3738,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                   <button
                     type="button"
                     onClick={() => setLinkModal((prev) => ({ ...prev, isOpen: false }))}
-                    className="px-3.5 py-1.5 rounded-full text-xs font-semibold text-warm-muted bg-cream-surface active:scale-95 transition-transform"
+                    className="px-5 py-2.5 rounded-full text-xs font-semibold text-warm-muted hover:text-warm-text active:scale-95 transition-all"
                   >
                     {t('deselect_all')}
                   </button>
@@ -3689,7 +3747,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                   type="button"
                   onClick={applyLink}
                   disabled={!linkModal.url.trim()}
-                  className="px-5 py-1.5 rounded-full text-xs font-semibold text-[#FAF8F5] bg-warm-accent active:scale-95 transition-transform disabled:opacity-40"
+                  className="flex-1 max-w-[200px] py-2.5 rounded-full text-sm font-semibold text-[#FAF8F5] bg-warm-accent active:scale-95 transition-all disabled:opacity-30"
                 >
                   {t('link_apply')}
                 </button>
@@ -3698,97 +3756,96 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
           </div>,
           document.body
         )}
+
       {showExportModal &&
         createPortal(
           <div
             onClick={() => {
               if (!isExporting) setShowExportModal(false);
             }}
-            className="fixed inset-0 z-50 flex flex-col justify-end bg-[#24201D]/45 transition-opacity duration-150"
+            className="fixed inset-0 z-50 flex justify-center bg-[#FAF8F5] animate-sheet-up"
           >
             <div
               onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-[420px] mx-auto bg-[#FAF8F5] rounded-t-3xl border-t border-cream-divider px-6 pt-3 flex flex-col gap-3 animate-sheet-up"
-              style={{
-                paddingBottom: 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 18px)',
-              }}
+              className="w-full max-w-[420px] h-full flex flex-col bg-[#FAF8F5]"
             >
-              <div className="w-10 h-1 rounded-full bg-cream-divider self-center shrink-0 mb-1" />
-
-              <div className="flex items-center justify-between pb-1">
-                <span className="text-xs font-semibold uppercase tracking-wider text-warm-text">
+              <div className="flex items-center justify-between px-6 pt-5 pb-3 shrink-0">
+                <span className="text-sm font-semibold tracking-wide text-warm-text">
                   {t('export_modal_title')}
                 </span>
                 <button
                   type="button"
                   disabled={isExporting}
                   onClick={() => setShowExportModal(false)}
-                  className="w-6 h-6 flex items-center justify-center rounded-full text-warm-muted hover:text-warm-text disabled:opacity-30"
+                  className="w-8 h-8 flex items-center justify-center rounded-full text-warm-muted hover:bg-cream-surface transition-colors disabled:opacity-30"
                 >
-                  <span className="material-symbols-outlined text-[16px]">close</span>
+                  <span className="material-symbols-outlined text-[20px]">close</span>
                 </button>
               </div>
 
-              <div className="flex flex-col gap-1 max-h-[38vh] overflow-y-auto no-scrollbar">
-                <label className="flex items-center justify-between py-2 px-2.5 rounded-xl bg-cream-surface/50 border border-cream-divider/50 cursor-pointer select-none">
-                  <div className="flex items-center gap-2">
-                    <span className="material-symbols-outlined text-[16px] text-warm-accent">send</span>
-                    <span className="text-xs font-medium text-warm-text">{t('export_private_chat')}</span>
+              <div className="flex-1 overflow-y-auto px-6 py-2 flex flex-col">
+                <label className="flex items-center justify-between py-4 border-b border-cream-divider/50 cursor-pointer select-none group">
+                  <div className="flex items-center gap-3.5">
+                    <span className="material-symbols-outlined text-[20px] text-warm-accent">send</span>
+                    <span className="text-sm text-warm-text font-medium">{t('export_private_chat')}</span>
                   </div>
                   <input
                     type="checkbox"
                     disabled={isExporting}
                     checked={sendToUserChat}
                     onChange={(e) => setSendToUserChat(e.target.checked)}
-                    className="w-4 h-4 accent-warm-accent rounded"
+                    className="w-5 h-5 accent-warm-accent rounded border-cream-divider"
                   />
                 </label>
 
-                <div className="pt-2 pb-1">
-                  <span className="text-[10px] font-semibold text-warm-muted uppercase tracking-wider">
+                <div className="pt-6 pb-2">
+                  <span className="text-[10px] font-semibold uppercase tracking-widest text-warm-subtle">
                     {t('export_select_channels')}
                   </span>
                 </div>
-
+                
                 {(!channels || channels.length === 0) ? (
-                  <div className="p-3 text-center text-[11px] text-warm-subtle italic bg-cream-surface/30 rounded-xl">
+                  <div className="py-4 text-[11px] text-warm-subtle italic">
                     {t('no_channels_hint')}
                   </div>
                 ) : (
-                  channels.map((ch) => {
-                    const isChecked = selectedExportChannels.includes(ch.id);
-                    return (
-                      <label
-                        key={ch.id}
-                        className={`flex items-center justify-between py-2 px-2.5 rounded-xl border transition-colors cursor-pointer select-none ${
-                          isChecked
-                            ? 'bg-cream-surface border-warm-accent/40'
-                            : 'bg-transparent border-cream-divider/40'
-                        }`}
-                      >
-                        <div className="flex items-center gap-2 min-w-0 pr-2">
-                          <span className="material-symbols-outlined text-[16px] text-warm-accent">tag</span>
-                          <span className="text-xs font-medium text-warm-text truncate">{ch.title}</span>
-                        </div>
-                        <input
-                          type="checkbox"
-                          disabled={isExporting}
-                          checked={isChecked}
-                          onChange={() => toggleChannelSelection(ch.id)}
-                          className="w-4 h-4 accent-warm-accent rounded shrink-0"
-                        />
-                      </label>
-                    );
-                  })
+                  <div className="flex flex-col">
+                    {channels.map((ch) => {
+                      const isChecked = selectedExportChannels.includes(ch.id);
+                      return (
+                        <label
+                          key={ch.id}
+                          className="flex items-center justify-between py-3.5 border-b border-cream-divider/50 cursor-pointer select-none group"
+                        >
+                          <div className="flex items-center gap-3.5 min-w-0 pr-4">
+                            <span className={`material-symbols-outlined text-[18px] transition-colors ${isChecked ? 'text-warm-text' : 'text-warm-muted group-hover:text-warm-text'}`}>tag</span>
+                            <span className={`text-sm truncate transition-colors ${isChecked ? 'font-medium text-warm-text' : 'text-warm-muted group-hover:text-warm-text'}`}>{ch.title}</span>
+                          </div>
+                          <input
+                            type="checkbox"
+                            disabled={isExporting}
+                            checked={isChecked}
+                            onChange={() => toggleChannelSelection(ch.id)}
+                            className="w-5 h-5 accent-warm-accent rounded border-cream-divider shrink-0"
+                          />
+                        </label>
+                      );
+                    })}
+                  </div>
                 )}
               </div>
 
-              <div className="flex items-center justify-end gap-2 pt-2 border-t border-cream-divider/50">
+              <div 
+                className="px-6 py-4 flex items-center justify-end gap-3 shrink-0"
+                style={{
+                  paddingBottom: 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 16px)',
+                }}
+              >
                 <button
                   type="button"
                   disabled={isExporting}
                   onClick={() => setShowExportModal(false)}
-                  className="px-3.5 py-1.5 rounded-full text-xs font-medium text-warm-muted bg-cream-surface active:scale-95 transition-transform disabled:opacity-30"
+                  className="px-5 py-2.5 rounded-full text-xs font-semibold text-warm-muted hover:text-warm-text active:scale-95 transition-transform disabled:opacity-30"
                 >
                   {t('deselect_all')}
                 </button>
@@ -3796,11 +3853,11 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                   type="button"
                   onClick={handleExport}
                   disabled={isExporting || (!sendToUserChat && selectedExportChannels.length === 0)}
-                  className="px-4 py-1.5 rounded-full text-xs font-semibold text-[#FAF8F5] bg-warm-accent active:scale-95 transition-all disabled:opacity-30 flex items-center gap-1.5"
+                  className="px-6 py-2.5 rounded-full text-sm font-semibold text-[#FAF8F5] bg-warm-text active:scale-95 transition-all disabled:opacity-30 flex items-center gap-2"
                 >
                   {isExporting ? (
                     <>
-                      <div className="w-3 h-3 rounded-full border-[1.5px] border-white/20 border-t-white animate-spin" />
+                      <div className="w-4 h-4 rounded-full border-[2px] border-white/20 border-t-white animate-spin" />
                       <span>{t('exporting')}</span>
                     </>
                   ) : (
@@ -3812,37 +3869,35 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
           </div>,
           document.body
         )}
+
       {editingButtonModal &&
         createPortal(
           <div
             data-modal="true"
             onClick={() => setEditingButtonModal(null)}
-            className="fixed inset-0 z-50 flex flex-col justify-end bg-[#24201D]/45 transition-opacity duration-150"
+            className="fixed inset-0 z-50 flex justify-center bg-[#FAF8F5] animate-sheet-up"
           >
             <div
               data-modal="true"
               onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-[420px] mx-auto bg-[#FAF8F5] rounded-t-3xl border-t border-cream-divider px-6 pt-3 pb-6 flex flex-col gap-3.5 shadow-xl animate-sheet-up"
-              style={{
-                paddingBottom: 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 18px)',
-              }}
+              className="w-full max-w-[420px] h-full flex flex-col bg-[#FAF8F5]"
             >
-              <div className="w-10 h-1 rounded-full bg-cream-divider self-center shrink-0 mb-1" />
-              <div className="flex items-center justify-between pb-1 border-b border-cream-divider/50">
-                <span className="text-xs font-semibold uppercase tracking-wider text-warm-text">
+              <div className="flex items-center justify-between px-6 pt-5 pb-3 shrink-0">
+                <span className="text-sm font-semibold tracking-wide text-warm-text">
                   {t('btn_edit_title')}
                 </span>
                 <button
                   type="button"
                   onClick={() => setEditingButtonModal(null)}
-                  className="w-6 h-6 flex items-center justify-center rounded-full text-warm-muted hover:text-warm-text"
+                  className="w-8 h-8 flex items-center justify-center rounded-full text-warm-muted hover:bg-cream-surface transition-colors"
                 >
-                  <span className="material-symbols-outlined text-[16px]">close</span>
+                  <span className="material-symbols-outlined text-[20px]">close</span>
                 </button>
               </div>
-              <div className="flex flex-col gap-2.5">
+
+              <div className="flex-1 overflow-y-auto px-6 py-2 flex flex-col gap-6">
                 <div className="flex flex-col gap-1">
-                  <label className="text-[10px] font-semibold uppercase text-warm-muted">
+                  <label className="text-[10px] font-semibold uppercase tracking-widest text-warm-subtle">
                     {t('btn_text_label')}
                   </label>
                   <input
@@ -3852,58 +3907,63 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                     onChange={(e) =>
                       setEditingButtonModal({ ...editingButtonModal, text: e.target.value })
                     }
-                    className="w-full bg-cream-surface rounded-xl px-3 py-2 text-xs text-warm-text border-none focus:outline-none"
+                    className="w-full bg-transparent border-b border-cream-divider px-1 py-2.5 text-sm text-warm-text focus:outline-none focus:border-warm-accent transition-colors"
                   />
                 </div>
-                <div className="flex items-center bg-cream-surface p-1 rounded-xl gap-1">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setEditingButtonModal({ ...editingButtonModal, type: 'url' })
-                    }
-                    className={`flex-1 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                      editingButtonModal.type === 'url'
-                        ? 'bg-[#FAF8F5] text-warm-accent shadow-xs'
-                        : 'text-warm-muted'
-                    }`}
-                  >
-                    {t('btn_type_url')}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setEditingButtonModal({ ...editingButtonModal, type: 'copy_text' })
-                    }
-                    className={`flex-1 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                      editingButtonModal.type === 'copy_text'
-                        ? 'bg-[#FAF8F5] text-warm-accent shadow-xs'
-                        : 'text-warm-muted'
-                    }`}
-                  >
-                    {t('btn_type_copy')}
-                  </button>
+                
+                <div className="flex flex-col gap-4">
+                  <div className="flex items-center bg-cream-surface/60 p-1 rounded-lg">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setEditingButtonModal({ ...editingButtonModal, type: 'url' })
+                      }
+                      className={`flex-1 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                        editingButtonModal.type === 'url'
+                          ? 'bg-[#FAF8F5] text-warm-text shadow-sm'
+                          : 'text-warm-muted hover:text-warm-text'
+                      }`}
+                    >
+                      {t('btn_type_url')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setEditingButtonModal({ ...editingButtonModal, type: 'copy_text' })
+                      }
+                      className={`flex-1 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                        editingButtonModal.type === 'copy_text'
+                          ? 'bg-[#FAF8F5] text-warm-text shadow-sm'
+                          : 'text-warm-muted hover:text-warm-text'
+                      }`}
+                    >
+                      {t('btn_type_copy')}
+                    </button>
+                  </div>
+                  
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] font-semibold uppercase tracking-widest text-warm-subtle">
+                      {editingButtonModal.type === 'url' ? 'URL Link' : 'Copy Value'}
+                    </label>
+                    <input
+                      type="text"
+                      value={editingButtonModal.value}
+                      placeholder={
+                        editingButtonModal.type === 'url'
+                          ? t('btn_url_placeholder')
+                          : t('btn_copy_placeholder')
+                      }
+                      onChange={(e) =>
+                        setEditingButtonModal({ ...editingButtonModal, value: e.target.value })
+                      }
+                      className="w-full bg-transparent border-b border-cream-divider px-1 py-2.5 text-sm text-warm-text focus:outline-none focus:border-warm-accent transition-colors font-mono"
+                    />
+                  </div>
                 </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-[10px] font-semibold uppercase text-warm-muted">
-                    {editingButtonModal.type === 'url' ? 'URL Link' : 'Copy Value'}
-                  </label>
-                  <input
-                    type="text"
-                    value={editingButtonModal.value}
-                    placeholder={
-                      editingButtonModal.type === 'url'
-                        ? t('btn_url_placeholder')
-                        : t('btn_copy_placeholder')
-                    }
-                    onChange={(e) =>
-                      setEditingButtonModal({ ...editingButtonModal, value: e.target.value })
-                    }
-                    className="w-full bg-cream-surface rounded-xl px-3 py-2 text-xs text-warm-text border-none focus:outline-none"
-                  />
-                </div>
-                <div className="flex flex-col gap-1 pt-1">
-                  <label className="text-[10px] font-semibold uppercase text-warm-muted">Color Theme</label>
-                  <div className="grid grid-cols-4 gap-2">
+
+                <div className="flex flex-col gap-3 pt-2">
+                  <label className="text-[10px] font-semibold uppercase tracking-widest text-warm-subtle">Theme</label>
+                  <div className="flex flex-wrap gap-3">
                     {(['default', 'primary', 'success', 'danger'] as const).map((clr) => {
                       const isActive = editingButtonModal.style === clr;
                       const label = t(`btn_style_${clr}` as any);
@@ -3922,19 +3982,25 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                           onClick={() =>
                             setEditingButtonModal({ ...editingButtonModal, style: clr })
                           }
-                          className={`flex flex-col items-center gap-1 p-2 rounded-xl border transition-all ${
-                            isActive ? 'border-warm-accent bg-warm-accent-light' : 'border-transparent bg-cream-surface'
+                          className={`flex items-center gap-2 px-3 py-1.5 rounded-full border transition-all ${
+                            isActive ? 'border-warm-text bg-cream-surface' : 'border-cream-divider bg-transparent opacity-70 hover:opacity-100'
                           }`}
                         >
-                          <div className={`w-4 h-4 rounded-full ${bgClass}`} />
-                          <span className="text-[10px] font-medium text-warm-text">{label}</span>
+                          <div className={`w-3.5 h-3.5 rounded-full ${bgClass} shrink-0`} />
+                          <span className={`text-[11px] font-medium ${isActive ? 'text-warm-text' : 'text-warm-muted'}`}>{label}</span>
                         </button>
                       );
                     })}
                   </div>
                 </div>
               </div>
-              <div className="flex items-center justify-between gap-2 pt-2 border-t border-cream-divider/50">
+
+              <div 
+                className="px-6 py-4 flex items-center justify-between gap-3 shrink-0"
+                style={{
+                  paddingBottom: 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 16px)',
+                }}
+              >
                 <button
                   type="button"
                   onClick={() =>
@@ -3943,14 +4009,14 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                       editingButtonModal.buttonIndex
                     )
                   }
-                  className="px-3 py-1.5 rounded-full text-xs font-semibold text-red-600 bg-red-50 active:scale-95 transition-transform"
+                  className="px-5 py-2.5 rounded-full text-xs font-semibold text-red-600 bg-red-50 hover:bg-red-100 active:scale-95 transition-transform"
                 >
                   {t('btn_delete')}
                 </button>
                 <button
                   type="button"
                   onClick={saveEditedButton}
-                  className="px-5 py-1.5 rounded-full text-xs font-semibold text-[#FAF8F5] bg-warm-accent active:scale-95 transition-transform"
+                  className="flex-1 max-w-[200px] py-2.5 rounded-full text-sm font-semibold text-[#FAF8F5] bg-warm-accent active:scale-95 transition-transform"
                 >
                   {t('btn_save')}
                 </button>
@@ -3959,37 +4025,35 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
           </div>,
           document.body
         )}
+
       {timePickerModal.isOpen &&
         createPortal(
           <div
             data-modal="true"
             onClick={() => setTimePickerModal((prev) => ({ ...prev, isOpen: false }))}
-            className="fixed inset-0 z-50 flex flex-col justify-end bg-[#24201D]/45 transition-opacity duration-150"
+            className="fixed inset-0 z-50 flex justify-center bg-[#FAF8F5] animate-sheet-up"
           >
             <div
               data-modal="true"
               onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-[420px] mx-auto bg-[#FAF8F5] rounded-t-3xl border-t border-cream-divider px-6 pt-3 pb-6 flex flex-col gap-3.5 shadow-xl animate-sheet-up"
-              style={{
-                paddingBottom: 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 18px)',
-              }}
+              className="w-full max-w-[420px] h-full flex flex-col bg-[#FAF8F5]"
             >
-              <div className="w-10 h-1 rounded-full bg-cream-divider self-center shrink-0 mb-1" />
-              <div className="flex items-center justify-between pb-1 border-b border-cream-divider/50">
-                <span className="text-xs font-semibold uppercase tracking-wider text-warm-text">
+              <div className="flex items-center justify-between px-6 pt-5 pb-3 shrink-0">
+                <span className="text-sm font-semibold tracking-wide text-warm-text">
                   {t('time_modal_title')}
                 </span>
                 <button
                   type="button"
                   onClick={() => setTimePickerModal((prev) => ({ ...prev, isOpen: false }))}
-                  className="w-6 h-6 flex items-center justify-center rounded-full text-warm-muted hover:text-warm-text"
+                  className="w-8 h-8 flex items-center justify-center rounded-full text-warm-muted hover:bg-cream-surface transition-colors"
                 >
-                  <span className="material-symbols-outlined text-[16px]">close</span>
+                  <span className="material-symbols-outlined text-[20px]">close</span>
                 </button>
               </div>
-              <div className="flex flex-col gap-3">
-                <div className="flex flex-col gap-1">
-                  <label className="text-[10px] font-semibold uppercase text-warm-muted">
+
+              <div className="flex-1 overflow-y-auto px-6 py-2 flex flex-col gap-8">
+                <div className="flex flex-col gap-2">
+                  <label className="text-[10px] font-semibold uppercase tracking-widest text-warm-subtle">
                     {t('time_label_datetime')}
                   </label>
                   <input
@@ -3998,50 +4062,61 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
                     onChange={(e) =>
                       setTimePickerModal((prev) => ({ ...prev, datetimeVal: e.target.value }))
                     }
-                    className="w-full bg-cream-surface rounded-xl px-3 py-2 text-xs text-warm-text border-none focus:outline-none font-mono"
+                    className="w-full bg-transparent border-b border-cream-divider px-1 py-2.5 text-base text-warm-text focus:outline-none focus:border-warm-accent transition-colors font-mono"
                   />
                 </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-[10px] font-semibold uppercase text-warm-muted">
+                
+                <div className="flex flex-col gap-3">
+                  <label className="text-[10px] font-semibold uppercase tracking-widest text-warm-subtle">
                     {t('time_label_format')}
                   </label>
-                  <div className="grid grid-cols-2 gap-1.5">
+                  <div className="flex flex-col">
                     {[
                       { id: 'wDT', labelKey: 'time_format_wdt' },
                       { id: 'full', labelKey: 'time_format_full' },
                       { id: 'time', labelKey: 'time_format_time_only' },
                       { id: 'rel', labelKey: 'time_format_rel' },
-                    ].map((fmt) => (
-                      <button
-                        key={fmt.id}
-                        type="button"
-                        onClick={() =>
-                          setTimePickerModal((prev) => ({ ...prev, format: fmt.id as any }))
-                        }
-                        className={`py-2 px-2 rounded-xl text-left text-[11px] font-medium border transition-colors flex flex-col gap-0.5 ${
-                          timePickerModal.format === fmt.id
-                            ? 'bg-warm-accent-light border-warm-accent text-warm-accent'
-                            : 'bg-cream-surface border-transparent text-warm-text'
-                        }`}
-                      >
-                        <span className="font-semibold">{t(fmt.labelKey as any)}</span>
-                      </button>
-                    ))}
+                    ].map((fmt) => {
+                      const isSelected = timePickerModal.format === fmt.id;
+                      return (
+                        <button
+                          key={fmt.id}
+                          type="button"
+                          onClick={() =>
+                            setTimePickerModal((prev) => ({ ...prev, format: fmt.id as any }))
+                          }
+                          className="flex items-center justify-between py-3.5 border-b border-cream-divider/50 group"
+                        >
+                          <span className={`text-sm transition-colors ${isSelected ? 'font-medium text-warm-text' : 'text-warm-muted group-hover:text-warm-text'}`}>
+                            {t(fmt.labelKey as any)}
+                          </span>
+                          <div className={`w-4 h-4 rounded-full border flex items-center justify-center transition-all ${isSelected ? 'border-warm-accent bg-warm-accent' : 'border-warm-subtle bg-transparent'}`}>
+                            {isSelected && <div className="w-1.5 h-1.5 rounded-full bg-[#FAF8F5]" />}
+                          </div>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
               </div>
-              <div className="flex items-center justify-end gap-2 pt-2 border-t border-cream-divider/50">
+
+              <div 
+                className="px-6 py-4 flex items-center justify-end gap-3 shrink-0"
+                style={{
+                  paddingBottom: 'calc(max(var(--tg-content-bottom, 0px), var(--tg-safe-bottom, 0px), env(safe-area-inset-bottom, 0px)) + 16px)',
+                }}
+              >
                 <button
                   type="button"
                   onClick={() => setTimePickerModal((prev) => ({ ...prev, isOpen: false }))}
-                  className="px-3.5 py-1.5 rounded-full text-xs font-semibold text-warm-muted bg-cream-surface active:scale-95 transition-transform"
+                  className="px-5 py-2.5 rounded-full text-xs font-semibold text-warm-muted hover:text-warm-text active:scale-95 transition-all"
                 >
                   {t('deselect_all')}
                 </button>
                 <button
                   type="button"
                   onClick={insertDynamicTime}
-                  className="px-5 py-1.5 rounded-full text-xs font-semibold text-[#FAF8F5] bg-warm-accent active:scale-95 transition-transform"
+                  className="px-6 py-2.5 rounded-full text-sm font-semibold text-[#FAF8F5] bg-warm-text active:scale-95 transition-transform"
                 >
                   {t('time_insert')}
                 </button>
@@ -4050,6 +4125,7 @@ const handleSlideNav = (blockId: string, direction: 'prev' | 'next', total: numb
           </div>,
           document.body
         )}
+
       {botPromptModal.isOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-[#24201D]/40 animate-page-fade">
           <div className="w-full max-w-sm p-5 rounded-2xl bg-[#FAF8F5] border border-cream-divider shadow-sm flex flex-col gap-3.5">
